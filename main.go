@@ -439,6 +439,7 @@ type registry struct {
 	byKey map[string]*trackedPair
 	refs  map[common.Address]*addrRef
 	v3   map[common.Address]*trackedPair // Uniswap V3 pool addr -> tracked pair (для Swap-триггера)
+	v3Only map[common.Address]*v3Quote // Uniswap V3 pool addr -> quote token (для V3↔V3 и V3-триггера без V2)
 }
 
 func newRegistry() *registry {
@@ -446,6 +447,7 @@ func newRegistry() *registry {
 		byKey: make(map[string]*trackedPair),
 		refs:  make(map[common.Address]*addrRef),
 		v3:    make(map[common.Address]*trackedPair),
+		v3Only: make(map[common.Address]*v3Quote),
 	}
 }
 
@@ -464,7 +466,7 @@ func (r *registry) poolAddressCount() int {
 func (r *registry) v3PoolCount() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return len(r.v3)
+	return len(r.v3) + len(r.v3Only)
 }
 
 func (r *registry) snapshotAddresses() []common.Address {
@@ -480,9 +482,15 @@ func (r *registry) snapshotAddresses() []common.Address {
 func (r *registry) snapshotV3Pools() []common.Address {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make([]common.Address, 0, len(r.v3))
+	out := make([]common.Address, 0, len(r.v3)+len(r.v3Only))
 	for a := range r.v3 {
 		out = append(out, a)
+	}
+	for a := range r.v3Only {
+		// не дублируем адрес, если он уже в r.v3
+		if r.v3[a] == nil {
+			out = append(out, a)
+		}
 	}
 	return out
 }
@@ -499,12 +507,41 @@ func (r *registry) getV3TP(addr common.Address) *trackedPair {
 	return r.v3[addr]
 }
 
+func (r *registry) getV3Only(addr common.Address) *v3Quote {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.v3Only[addr]
+}
+
 func (r *registry) hasWETHQuote(quote common.Address) bool {
 	t0, t1 := sortTokens(addrWETH, quote)
 	key := pairKeyString(t0, t1)
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.byKey[key] != nil
+}
+
+func (r *registry) registerV3QuotePools(ctx context.Context, ec *ethclient.Client, quote common.Address, label string) {
+	if !enableV3Arb || ec == nil {
+		return
+	}
+	for _, fee := range v3FeeTiers {
+		p, err := getV3Pool(ctx, ec, addrWETH, quote, fee)
+		if err != nil || p == (common.Address{}) {
+			continue
+		}
+		r.mu.Lock()
+		// Если этот пул уже привязан к полноценной V2 trackedPair — оставляем её как более «богатый» контекст.
+		if r.v3[p] == nil && r.v3Only[p] == nil {
+			r.v3Only[p] = &v3Quote{quote: quote, label: label}
+		}
+		r.mu.Unlock()
+	}
+}
+
+type v3Quote struct {
+	quote common.Address
+	label string
 }
 
 // minWETHReserveBothPools — min(WETH-сторона Uni, WETH-сторона Sushi) для WETH/quote; ok=false если нет пула.
@@ -1148,6 +1185,46 @@ var lastPrintAt time.Time
 // fee tiers to probe on Uniswap V3 (common on Base).
 var v3FeeTiers = []uint32{3000, 500, 10000, 100}
 
+func evaluateV3OnlyOpportunity(parentCtx context.Context, ec *ethclient.Client, quote common.Address, label string) {
+	if !enableV3Arb || ec == nil {
+		return
+	}
+	wethIn := notionalUSDToWETHWei()
+	if wethIn.Sign() <= 0 {
+		return
+	}
+	gasUSD := dynamicGasUSD()
+	ctxH, cancel := context.WithTimeout(parentCtx, 6*time.Second)
+	pot, buy, sell, ok := v3V3BestProfit(ctxH, ec, quote, wethIn, gasUSD)
+	cancel()
+	if !ok || pot == nil || pot.Sign() <= 0 {
+		return
+	}
+	var netPct big.Rat
+	if ratNotional.Sign() > 0 {
+		var q big.Rat
+		q.Quo(pot, ratNotional)
+		netPct.Mul(&q, rat100)
+	}
+	if netPct.Cmp(minNetProfitThreshold) <= 0 {
+		return
+	}
+	netF, _ := netPct.Float64()
+	potF, _ := pot.Float64()
+	gasF, _ := gasUSD.Float64()
+
+	if netPct.Cmp(statsOpportunityThreshold) >= 0 {
+		appStats.recordOpportunity(potF, label)
+	}
+	if !shouldPrint(netF, buy, sell, label, spamPrintMode) {
+		return
+	}
+	ts := time.Now().Format("15:04:05.000")
+	nf, _ := ratNotional.Float64()
+	log.Printf("[%s] PROFIT FOUND: %.3f%% NET(sim,$%.0f V3+V3 gas~$%.4f) | %s | BUY: %s | SELL: %s | POTENTIAL: $%.2f",
+		ts, netF, nf, gasF, label, buy, sell, potF)
+}
+
 func shouldPrint(netPct float64, buy, sell, pairLabel string, spam bool) bool {
 	key := fmt.Sprintf("%.4f|%s|%s|%s", netPct, buy, sell, pairLabel)
 	now := time.Now()
@@ -1284,16 +1361,15 @@ func (r *registry) tryRegisterWETHPair(ctx context.Context, ec *ethclient.Client
 	if enableV3Arb && ec != nil {
 		for _, fee := range v3FeeTiers {
 			p, err := getV3Pool(ctx, ec, addrWETH, quote, fee)
-			if err != nil {
-				continue
-			}
-			if p == (common.Address{}) {
+			if err != nil || p == (common.Address{}) {
 				continue
 			}
 			r.mu.Lock()
 			if r.v3[p] == nil {
 				r.v3[p] = tp
 			}
+			// если ранее был v3Only — заменяем на trackedPair
+			delete(r.v3Only, p)
 			r.mu.Unlock()
 		}
 	}
@@ -1341,6 +1417,8 @@ func bootstrapRegistry(ctx context.Context, ec *ethclient.Client, reg *registry)
 		if added {
 			registered++
 		}
+		// Даже если V2-пара отсутствует, всё равно привяжем V3 пулы для V3↔V3 арбитража и Swap-триггера.
+		reg.registerV3QuotePools(ctx, ec, q.addr, q.symbol)
 	}
 	if reg.pairCount() == 0 {
 		if firstErr != nil {
@@ -1563,11 +1641,14 @@ func listenV3SwapBatch(ctx context.Context, ec *ethclient.Client, reg *registry,
 			return err
 		case lg := <-ch:
 			atomic.AddUint64(&v3SwapLogsReceived, 1)
-			tp := reg.getV3TP(lg.Address)
-			if tp == nil {
+			if tp := reg.getV3TP(lg.Address); tp != nil {
+				tp.evaluateAndMaybePrint()
 				continue
 			}
-			tp.evaluateAndMaybePrint()
+			// V3-only: нет UniV2+SushiV2, но можно считать V3↔V3 по fee tiers.
+			if vq := reg.getV3Only(lg.Address); vq != nil {
+				evaluateV3OnlyOpportunity(ctx, ec, vq.quote, vq.label)
+			}
 		}
 	}
 }

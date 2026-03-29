@@ -244,6 +244,70 @@ func v3TelemetrySnapshot() (getPoolC, getPoolOKC, qC, qOKC, qErrC, hyC, hyOKC, h
 		atomic.LoadUint64(&hybridPositiveNet)
 }
 
+// v3V3BestProfit — round-trip WETH -> quote (feeA) -> WETH (feeB), best net USD after gas.
+func v3V3BestProfit(
+	ctx context.Context,
+	ec *ethclient.Client,
+	quote common.Address,
+	wethIn *big.Int,
+	baseGasUSD *big.Rat,
+) (potNet *big.Rat, buyName, sellName string, ok bool) {
+	if ec == nil || wethIn == nil || wethIn.Sign() <= 0 {
+		return nil, "", "", false
+	}
+	// Газ на два V3 свопа примерно сопоставим с гибридом, но без V2: используем hybridGasMult как общий множитель.
+	gasV3V3 := new(big.Rat).Mul(baseGasUSD, hybridGasMult)
+
+	fees := []uint32{3000, 500, 10000, 100}
+	var bestWei *big.Int
+	var bBuy, bSell string
+
+	try := func(tagBuy, tagSell string, wBack *big.Int) {
+		if wBack == nil || wBack.Sign() <= 0 {
+			return
+		}
+		if bestWei == nil || wBack.Cmp(bestWei) > 0 {
+			bestWei = new(big.Int).Set(wBack)
+			bBuy, bSell = tagBuy, tagSell
+		}
+	}
+
+	for _, feeA := range fees {
+		// убедимся, что пул существует
+		pA, err := getV3Pool(ctx, ec, addrWETH, quote, feeA)
+		if err != nil || pA == (common.Address{}) {
+			continue
+		}
+		// WETH -> quote
+		qOut, err := quoteV3ExactInputSingle(ctx, ec, addrWETH, quote, feeA, wethIn)
+		if err != nil || qOut == nil || qOut.Sign() <= 0 {
+			continue
+		}
+		for _, feeB := range fees {
+			if feeB == feeA {
+				continue
+			}
+			pB, err := getV3Pool(ctx, ec, addrWETH, quote, feeB)
+			if err != nil || pB == (common.Address{}) {
+				continue
+			}
+			_ = pB // just existence
+			wBack, err := quoteV3ExactInputSingle(ctx, ec, quote, addrWETH, feeB, qOut)
+			if err != nil || wBack == nil || wBack.Sign() <= 0 {
+				continue
+			}
+			try("UniV3("+feeTag(feeA)+")", "UniV3("+feeTag(feeB)+")", wBack)
+		}
+	}
+	if bestWei == nil || bestWei.Sign() <= 0 || bBuy == "" {
+		return nil, "", "", false
+	}
+	profitWei := new(big.Int).Sub(bestWei, wethIn)
+	pUSD := new(big.Rat).Mul(new(big.Rat).SetFrac(profitWei, tenPowU8(18)), ethUsdHint)
+	pot := new(big.Rat).Sub(pUSD, gasV3V3)
+	return pot, bBuy, bSell, true
+}
+
 func feeTag(fee uint32) string {
 	switch fee {
 	case 100:
