@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -29,6 +30,19 @@ var (
 	quoterV2Parsed  abi.ABI
 	enableV3Arb     = true
 	hybridGasMult   = big.NewRat(135, 100) // V3+2×V2 свопы тяжелее; подстройка через HYBRID_GAS_MULT
+)
+
+// V3/Quoter telemetry (atomic).
+var (
+	v3GetPoolCalls      uint64
+	v3GetPoolOK         uint64
+	quoterCalls         uint64
+	quoterOK            uint64
+	quoterErr           uint64
+	hybridEvalCalls     uint64
+	hybridOk            uint64
+	hybridPositiveNet   uint64
+	hybridBestWethUp    uint64 // bestWei > wethIn
 )
 
 func init() {
@@ -61,6 +75,7 @@ func loadV3ArbSettings() {
 }
 
 func getV3Pool(ctx context.Context, ec *ethclient.Client, tokenA, tokenB common.Address, fee uint32) (common.Address, error) {
+	atomic.AddUint64(&v3GetPoolCalls, 1)
 	t0, t1 := sortTokens(tokenA, tokenB)
 	data, err := v3FactoryParsed.Pack("getPool", t0, t1, big.NewInt(int64(fee)))
 	if err != nil {
@@ -75,10 +90,14 @@ func getV3Pool(ctx context.Context, ec *ethclient.Client, tokenA, tokenB common.
 	if err := v3FactoryParsed.UnpackIntoInterface(&pool, "getPool", out); err != nil {
 		return common.Address{}, err
 	}
+	if pool != (common.Address{}) {
+		atomic.AddUint64(&v3GetPoolOK, 1)
+	}
 	return pool, nil
 }
 
 func quoteV3ExactInputSingle(ctx context.Context, ec *ethclient.Client, tokenIn, tokenOut common.Address, fee uint32, amountIn *big.Int) (*big.Int, error) {
+	atomic.AddUint64(&quoterCalls, 1)
 	type qparams struct {
 		TokenIn           common.Address `abi:"tokenIn"`
 		TokenOut          common.Address `abi:"tokenOut"`
@@ -100,16 +119,20 @@ func quoteV3ExactInputSingle(ctx context.Context, ec *ethclient.Client, tokenIn,
 	msg := ethereum.CallMsg{To: &addrQuoterV2Base, Data: data}
 	out, err := ec.CallContract(ctx, msg, nil)
 	if err != nil {
+		atomic.AddUint64(&quoterErr, 1)
 		return nil, err
 	}
 	vals, err := quoterV2Parsed.Unpack("quoteExactInputSingle", out)
 	if err != nil || len(vals) < 1 {
+		atomic.AddUint64(&quoterErr, 1)
 		return nil, err
 	}
 	amt, ok := vals[0].(*big.Int)
 	if !ok || amt == nil {
+		atomic.AddUint64(&quoterErr, 1)
 		return nil, err
 	}
+	atomic.AddUint64(&quoterOK, 1)
 	return amt, nil
 }
 
@@ -123,6 +146,7 @@ func hybridV3V2BestProfit(
 	u0, u1, s0, s1 *big.Int,
 	baseGasUSD *big.Rat,
 ) (potNet *big.Rat, buyName, sellName string, ok bool) {
+	atomic.AddUint64(&hybridEvalCalls, 1)
 	if ec == nil || wethIn == nil || wethIn.Sign() <= 0 {
 		return nil, "", "", false
 	}
@@ -195,10 +219,29 @@ func hybridV3V2BestProfit(
 	if bestWei == nil || bestWei.Sign() <= 0 || bBuy == "" {
 		return nil, "", "", false
 	}
+	atomic.AddUint64(&hybridOk, 1)
+	if bestWei.Cmp(wethIn) > 0 {
+		atomic.AddUint64(&hybridBestWethUp, 1)
+	}
 	profitWei := new(big.Int).Sub(bestWei, wethIn)
 	pUSD := new(big.Rat).Mul(new(big.Rat).SetFrac(profitWei, tenPowU8(18)), ethUsdHint)
 	pot := new(big.Rat).Sub(pUSD, gasHybrid)
+	if pot.Sign() > 0 {
+		atomic.AddUint64(&hybridPositiveNet, 1)
+	}
 	return pot, bBuy, bSell, true
+}
+
+func v3TelemetrySnapshot() (getPoolC, getPoolOKC, qC, qOKC, qErrC, hyC, hyOKC, hyUpC, hyPosC uint64) {
+	return atomic.LoadUint64(&v3GetPoolCalls),
+		atomic.LoadUint64(&v3GetPoolOK),
+		atomic.LoadUint64(&quoterCalls),
+		atomic.LoadUint64(&quoterOK),
+		atomic.LoadUint64(&quoterErr),
+		atomic.LoadUint64(&hybridEvalCalls),
+		atomic.LoadUint64(&hybridOk),
+		atomic.LoadUint64(&hybridBestWethUp),
+		atomic.LoadUint64(&hybridPositiveNet)
 }
 
 func feeTag(fee uint32) string {

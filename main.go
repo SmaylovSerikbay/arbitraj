@@ -216,6 +216,11 @@ func printStatsSummaryBlock() {
 	}
 	fmt.Println("================ STATS (" + durLabel + " RUN) ================")
 	fmt.Printf("Total Events Scanned: %s\n", formatWithCommas(totalEv))
+	fmt.Printf("  V2 Sync: %s | PairCreated: %s | V3 Swap: %s\n",
+		formatWithCommas(atomic.LoadUint64(&syncEventsParsed)),
+		formatWithCommas(atomic.LoadUint64(&pairCreatedLogsReceived)),
+		formatWithCommas(atomic.LoadUint64(&v3SwapLogsReceived)),
+	)
 	fmt.Printf("Opportunities Found: %d  (net ≥ %s%%)\n", opps, statsOpportunityThreshold.FloatString(2))
 	fmt.Printf("Total Potential Profit: $%.2f\n", total)
 	if best > 0 {
@@ -224,6 +229,16 @@ func printStatsSummaryBlock() {
 		fmt.Printf("Best Single Trade: —\n")
 	}
 	fmt.Printf("Current Bank Projection: +%.1f%%\n", proj)
+	if enableV3Arb {
+		gpC, gpOK, qC, qOK, qErr, hyC, hyOK, hyUp, hyPos := v3TelemetrySnapshot()
+		fmt.Printf("V3/Quoter: getPool ok %s/%s | quote ok %s/%s (err %s) | hybrid ok %s/%s | bestWei>wIn %s | net>0 %s\n",
+			formatWithCommas(gpOK), formatWithCommas(gpC),
+			formatWithCommas(qOK), formatWithCommas(qC), formatWithCommas(qErr),
+			formatWithCommas(hyOK), formatWithCommas(hyC),
+			formatWithCommas(hyUp),
+			formatWithCommas(hyPos),
+		)
+	}
 	fmt.Println("====================================================")
 }
 
