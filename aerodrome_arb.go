@@ -192,7 +192,7 @@ func bestV3OnlyProfit(
 	quote common.Address,
 	wethIn *big.Int,
 	baseGasUSD *big.Rat,
-) (potNet *big.Rat, buyName, sellName string, ok bool) {
+) (potNet *big.Rat, buyName, sellName, route string, ok bool) {
 	atomic.AddUint64(&v3OnlyEvalCalls, 1)
 	var best *big.Rat
 	var bb, ss string
@@ -213,14 +213,14 @@ func bestV3OnlyProfit(
 		}
 	}
 	if best == nil || best.Sign() <= 0 {
-		return nil, "", "", false
+		return nil, "", "", "", false
 	}
 	if bestRoute == "v3v3" {
 		atomic.AddUint64(&v3OnlyV3V3Wins, 1)
 	} else if bestRoute == "v3aero" {
 		atomic.AddUint64(&v3OnlyV3AeroWins, 1)
 	}
-	return best, bb, ss, true
+	return best, bb, ss, bestRoute, true
 }
 
 func v3OnlyTelemetrySnapshot() (evals, v3v3, v3aero uint64) {

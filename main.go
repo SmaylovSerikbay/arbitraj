@@ -62,6 +62,9 @@ var (
 	addrKEYCAT = common.HexToAddress("0x9a26f5433671751c3276a065f57e5a02d2817973") // Keyboard Cat
 	addrHIGHER = common.HexToAddress("0x0578d8A44db98B23BF096A382e016e29a5Ce0ffe")
 	addrBENJI  = common.HexToAddress("0xbc45647ea894030a4e9801ec03479739fa2485f0") // Basenji (мем)
+	// Приоритетные адреса из .env/плана (добавлены в стартовый список мониторинга).
+	addrDEGEN2  = common.HexToAddress("0x4edbc92d5a34f9510d5b44ab466502a8e07845a1")
+	addrVIRTUAL = common.HexToAddress("0x0b3e3284558222239713dA5A1df42502042C6758")
 )
 
 const (
@@ -162,7 +165,8 @@ var (
 type sessionStats struct {
 	mu              sync.Mutex
 	started         time.Time
-	opportunities   int64   // net-% ≥ statsOpportunityThreshold
+	oppV3V2         int64   // UniV3 ↔ UniV2/Sushi (net-% ≥ statsOpportunityThreshold)
+	oppV3Aero       int64   // UniV3 ↔ Aerodrome (net-% ≥ statsOpportunityThreshold)
 	totalPotential  float64 // сумма $ potential
 	bestPotential   float64
 	bestPairLabel   string
@@ -170,10 +174,22 @@ type sessionStats struct {
 
 var appStats sessionStats
 
-func (s *sessionStats) recordOpportunity(potentialUSD float64, pairLabel string) {
+type oppKind int
+
+const (
+	oppKindV3V2 oppKind = iota
+	oppKindV3Aero
+)
+
+func (s *sessionStats) recordOpportunity(kind oppKind, potentialUSD float64, pairLabel string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.opportunities++
+	switch kind {
+	case oppKindV3Aero:
+		s.oppV3Aero++
+	default:
+		s.oppV3V2++
+	}
 	s.totalPotential += potentialUSD
 	if potentialUSD > s.bestPotential {
 		s.bestPotential = potentialUSD
@@ -202,7 +218,8 @@ func formatWithCommas(n uint64) string {
 func printStatsSummaryBlock() {
 	totalEv := atomic.LoadUint64(&syncEventsParsed) + atomic.LoadUint64(&pairCreatedLogsReceived) + atomic.LoadUint64(&v3SwapLogsReceived)
 	appStats.mu.Lock()
-	opps := appStats.opportunities
+	oppsV3V2 := appStats.oppV3V2
+	oppsV3Aero := appStats.oppV3Aero
 	total := appStats.totalPotential
 	best := appStats.bestPotential
 	bestL := appStats.bestPairLabel
@@ -222,13 +239,16 @@ func printStatsSummaryBlock() {
 		proj = (total / notionalUSDForDisplay) * 100.0
 	}
 	fmt.Println("================ STATS (" + durLabel + " RUN) ================")
+	fmt.Printf("Running Time: %02d:%02d\n", h, m)
 	fmt.Printf("Total Events Scanned: %s\n", formatWithCommas(totalEv))
 	fmt.Printf("  V2 Sync: %s | PairCreated: %s | V3 Swap: %s\n",
 		formatWithCommas(atomic.LoadUint64(&syncEventsParsed)),
 		formatWithCommas(atomic.LoadUint64(&pairCreatedLogsReceived)),
 		formatWithCommas(atomic.LoadUint64(&v3SwapLogsReceived)),
 	)
-	fmt.Printf("Opportunities Found: %d  (net ≥ %s%%)\n", opps, statsOpportunityThreshold.FloatString(2))
+	fmt.Printf("Opportunities Found (net ≥ %s%%)\n", statsOpportunityThreshold.FloatString(2))
+	fmt.Printf("  UniV3 ↔ UniV2/Sushi: %d\n", oppsV3V2)
+	fmt.Printf("  Hybrid (V3 ↔ Aerodrome): %d\n", oppsV3Aero)
 	fmt.Printf("Total Potential Profit: $%.2f\n", total)
 	if best > 0 {
 		fmt.Printf("Best Single Trade: $%.2f (%s)\n", best, bestL)
@@ -309,10 +329,12 @@ var defaultQuoteTokens = []quoteToken{
 	{addrUSDbC, "WETH/USDbC"},
 	{addrDAI, "WETH/DAI"},
 	{addrDEGEN, "WETH/DEGEN"},
+	{addrDEGEN2, "WETH/DEGEN(v2)"},
 	{addrTOSHI, "WETH/TOSHI"},
 	{addrBRETT, "WETH/BRETT"},
 	{addrAERO, "WETH/AERO"},
 	{addrcbETH, "WETH/cbETH"},
+	{addrVIRTUAL, "WETH/VIRTUAL"},
 }
 
 // speculatorQuoteTokens — доп. мемы к ручному списку (DEGEN/TOSHI/AERO уже в defaultQuoteTokens).
@@ -1197,7 +1219,8 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 		}
 		tp.statMu.Unlock()
 		if allow {
-			appStats.recordOpportunity(simPotF, tp.label)
+			// Отдельная корзина для UniV3↔V2/Sushi — именно такие окна чаще всего видим сейчас.
+			appStats.recordOpportunity(oppKindV3V2, simPotF, tp.label)
 		}
 	}
 
@@ -1266,7 +1289,7 @@ func evaluateV3OnlyOpportunity(parentCtx context.Context, ec *ethclient.Client, 
 	}
 	gasUSD := dynamicGasUSD()
 	ctxH, cancel := context.WithTimeout(parentCtx, 8*time.Second)
-	pot, buy, sell, ok := bestV3OnlyProfit(ctxH, ec, quote, wethIn, gasUSD)
+	pot, buy, sell, route, ok := bestV3OnlyProfit(ctxH, ec, quote, wethIn, gasUSD)
 	cancel()
 	if !ok || pot == nil || pot.Sign() <= 0 {
 		return
@@ -1285,7 +1308,12 @@ func evaluateV3OnlyOpportunity(parentCtx context.Context, ec *ethclient.Client, 
 	gasF, _ := gasUSD.Float64()
 
 	if netPct.Cmp(statsOpportunityThreshold) >= 0 {
-		appStats.recordOpportunity(potF, label)
+		if route == "v3aero" {
+			appStats.recordOpportunity(oppKindV3Aero, potF, label)
+		} else {
+			// V3↔V3 не является нашим фокусом, но учитываем в «не V3↔Aero» корзину.
+			appStats.recordOpportunity(oppKindV3V2, potF, label)
+		}
 	}
 	if !shouldPrint(netF, buy, sell, label, spamPrintMode) {
 		return
@@ -1553,6 +1581,11 @@ func (r *registry) handlePairCreated(ctx context.Context, ec *ethclient.Client, 
 	label := "WETH/" + quote.Hex()[:10] + "…"
 	added, err := r.tryRegisterWETHPair(ctx, ec, quote, label, autoMinWethPerPool)
 	if err != nil {
+		// Тихий режим: ошибки лимита CU/s от Alchemy не печатаем.
+		if isRPCThroughputErr(err) {
+			// безопасно игнорировать: PairCreated повторится/поймаем позже; V3-only пулы всё равно привязали выше.
+			return
+		}
 		log.Printf("PairCreated: регистрация %s: %v", label, err)
 		return
 	}
