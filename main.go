@@ -1213,8 +1213,8 @@ func evaluateV3OnlyOpportunity(parentCtx context.Context, ec *ethclient.Client, 
 		return
 	}
 	gasUSD := dynamicGasUSD()
-	ctxH, cancel := context.WithTimeout(parentCtx, 6*time.Second)
-	pot, buy, sell, ok := v3V3BestProfit(ctxH, ec, quote, wethIn, gasUSD)
+	ctxH, cancel := context.WithTimeout(parentCtx, 8*time.Second)
+	pot, buy, sell, ok := bestV3OnlyProfit(ctxH, ec, quote, wethIn, gasUSD)
 	cancel()
 	if !ok || pot == nil || pot.Sign() <= 0 {
 		return
@@ -1240,7 +1240,7 @@ func evaluateV3OnlyOpportunity(parentCtx context.Context, ec *ethclient.Client, 
 	}
 	ts := time.Now().Format("15:04:05.000")
 	nf, _ := ratNotional.Float64()
-	log.Printf("[%s] PROFIT FOUND: %.3f%% NET(sim,$%.0f V3+V3 gas~$%.4f) | %s | BUY: %s | SELL: %s | POTENTIAL: $%.2f",
+	log.Printf("[%s] PROFIT FOUND: %.3f%% NET(sim,$%.0f V3-only gas~$%.4f) | %s | BUY: %s | SELL: %s | POTENTIAL: $%.2f",
 		ts, netF, nf, gasF, label, buy, sell, potF)
 }
 
@@ -1445,8 +1445,13 @@ func bootstrapRegistry(ctx context.Context, ec *ethclient.Client, reg *registry)
 		}
 		return errors.New("ни одна WETH-пара не найдена на обоих DEX (getPair пустой)")
 	}
-	log.Printf("bootstrap: вручную %d/%d пар | пулов Sync: %d | AUTO_DISCOVER в фоне (пропуски: нет Uni+Sushi V2 или WETH < AUTO_MIN_WETH_WEI; детали: LOG_SKIPPED_PAIRS=1)",
-		registered, len(list), reg.poolAddressCount())
+	if autoDiscoverEnabled {
+		log.Printf("bootstrap: вручную %d/%d пар | пулов Sync: %d | AUTO_DISCOVER в фоне (пропуски: нет Uni+Sushi V2 или WETH < AUTO_MIN_WETH_WEI; детали: LOG_SKIPPED_PAIRS=1)",
+			registered, len(list), reg.poolAddressCount())
+	} else {
+		log.Printf("bootstrap: вручную %d/%d пар | пулов Sync: %d | AUTO_DISCOVER выключен (пропуски: нет Uni+Sushi V2 или WETH < AUTO_MIN_WETH_WEI; детали: LOG_SKIPPED_PAIRS=1)",
+			registered, len(list), reg.poolAddressCount())
+	}
 	return nil
 }
 
@@ -2067,6 +2072,7 @@ func main() {
 	loadNotionalAndEthHint()
 	loadAutoDiscoverSettings()
 	loadV3ArbSettings()
+	loadAeroSettings()
 	loadMinNetProfitPct()
 	loadStatsOpportunityThreshold()
 	spamPrintMode = minNetProfitThreshold.Sign() <= 0
