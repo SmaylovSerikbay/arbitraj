@@ -583,6 +583,23 @@ func (r *registry) hasWETHQuote(quote common.Address) bool {
 	return r.byKey[key] != nil
 }
 
+// isQuoteMonitored — полная WETH/quote пара (Uni+Sushi V2) или хотя бы один V3-only пул WETH/quote.
+func (r *registry) isQuoteMonitored(quote common.Address) bool {
+	t0, t1 := sortTokens(addrWETH, quote)
+	key := pairKeyString(t0, t1)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if r.byKey[key] != nil {
+		return true
+	}
+	for _, vq := range r.v3Only {
+		if vq != nil && vq.quote == quote {
+			return true
+		}
+	}
+	return false
+}
+
 func (r *registry) registerV3QuotePools(ctx context.Context, ec *ethclient.Client, quote common.Address, label string) {
 	if !enableV3Arb || ec == nil {
 		return
@@ -1861,6 +1878,7 @@ func runSessionWebSocket(ctx context.Context, wssURL, httpURL string, splitHTTP 
 	}
 	go heartbeatMinuteLoop(innerCtx, reg)
 	go statsSummaryLoop(innerCtx)
+	go dexScreenerDiscoverLoop(innerCtx, ecCall, reg, bump)
 
 	select {
 	case <-ctx.Done():
@@ -1909,6 +1927,7 @@ func runSessionHTTPPoll(ctx context.Context, httpURL string) error {
 		return err
 	}
 	go autoDiscoverBackground(ctx, ec, reg, nil)
+	go dexScreenerDiscoverLoop(ctx, ec, reg, nil)
 
 	log.Printf("BASE_FORCE_HTTP_POLL: HTTP опрос getReserves (аналитика, не для боя)")
 	callOpts := &bind.CallOpts{Context: ctx}
@@ -2164,6 +2183,7 @@ func main() {
 	loadDotEnv()
 	loadNotionalAndEthHint()
 	loadAutoDiscoverSettings()
+	loadDexScreenerDiscoverSettings()
 	loadV3ArbSettings()
 	loadAeroSettings()
 	loadMinNetProfitPct()
