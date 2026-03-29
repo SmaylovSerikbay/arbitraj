@@ -424,6 +424,14 @@ type trackedPair struct {
 	lastOppSampleAt time.Time // не считать одну и ту же «вилку» тысячи раз на потоке Sync
 }
 
+// quoteToken — не-WETH сторона пары WETH/X.
+func (tp *trackedPair) quoteToken() common.Address {
+	if tp.token0 == addrWETH {
+		return tp.token1
+	}
+	return tp.token0
+}
+
 func sortTokens(a, b common.Address) (t0, t1 common.Address) {
 	if bytes.Compare(a[:], b[:]) < 0 {
 		return a, b
@@ -1210,10 +1218,25 @@ var lastPrintAt time.Time
 // fee tiers to probe on Uniswap V3 (common on Base).
 var v3FeeTiers = []uint32{3000, 500, 10000, 100}
 
+var v3OnlyEvalThrottleMu sync.Mutex
+var v3OnlyLastEvalAt = make(map[string]time.Time)
+
+// Ограничение частоты bestV3OnlyProfit при потоке V3 Swap (иначе сотни eth_call/сек на USDC и т.п.).
+const v3OnlyEvalMinGap = 400 * time.Millisecond
+
 func evaluateV3OnlyOpportunity(parentCtx context.Context, ec *ethclient.Client, quote common.Address, label string) {
 	if !enableV3Arb || ec == nil {
 		return
 	}
+	key := strings.ToLower(quote.Hex())
+	v3OnlyEvalThrottleMu.Lock()
+	if t, ok := v3OnlyLastEvalAt[key]; ok && time.Since(t) < v3OnlyEvalMinGap {
+		v3OnlyEvalThrottleMu.Unlock()
+		return
+	}
+	v3OnlyLastEvalAt[key] = time.Now()
+	v3OnlyEvalThrottleMu.Unlock()
+
 	wethIn := notionalUSDToWETHWei()
 	if wethIn.Sign() <= 0 {
 		return
@@ -1673,6 +1696,8 @@ func listenV3SwapBatch(ctx context.Context, ec *ethclient.Client, reg *registry,
 			atomic.AddUint64(&v3SwapLogsReceived, 1)
 			if tp := reg.getV3TP(lg.Address); tp != nil {
 				tp.evaluateAndMaybePrint()
+				// Тот же V3 Swap — для «полных» пар раньше не вызывался V3↔V3 / V3↔Aero (только hybrid V3↔V2).
+				evaluateV3OnlyOpportunity(ctx, ec, tp.quoteToken(), tp.label)
 				continue
 			}
 			// V3-only: нет UniV2+SushiV2, но можно считать V3↔V3 по fee tiers.
