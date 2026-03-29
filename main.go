@@ -1,4 +1,4 @@
-// Atomic arbitrage monitor: Uniswap V2 vs SushiSwap V2 (Base), paper trading only.
+// Atomic arbitrage monitor: Uniswap V2 ↔ SushiSwap V2 + гибрид UniV3 ↔ V2 (Base), paper trading only.
 //
 // Мульти-пары WETH/X: конфиг токенов + авто-добавление по PairCreated с обеих фабрик.
 // Подписка Sync — один eth_subscribe на все известные пул-адреса (перезапуск при новых парах).
@@ -949,7 +949,7 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 	s1 := new(big.Int).Set(tp.sushiR1)
 	tp.mu.Unlock()
 
-	if pUni.Cmp(&pSushi) == 0 {
+	if pUni.Cmp(&pSushi) == 0 && !enableV3Arb {
 		return
 	}
 	var minP, maxP big.Rat
@@ -978,7 +978,7 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 	midGross.Mul(ratNotional, &afterFees)
 	midBeforeGas.Quo(&midGross, rat100)
 	midPotNet.Sub(&midBeforeGas, gasUSD)
-	if midPotNet.Sign() <= 0 {
+	if midPotNet.Sign() <= 0 && !enableV3Arb {
 		return
 	}
 	var midNetQuo big.Rat
@@ -1003,14 +1003,32 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 	}
 
 	wethBack, simOK := simulateWETHRoundTrip(wethIsT0, buyR0, buyR1, sellR0, sellR1, wethIn)
-	if !simOK {
+	var simPotNet big.Rat
+	if simOK {
+		profitWei := new(big.Int).Sub(wethBack, wethIn)
+		simProfitUSD := new(big.Rat).Mul(new(big.Rat).SetFrac(profitWei, tenPowU8(18)), ethUsdHint)
+		simPotNet.Sub(simProfitUSD, gasUSD)
+	}
+	var quoteTok common.Address
+	if wethIsT0 {
+		quoteTok = tp.token1
+	} else {
+		quoteTok = tp.token0
+	}
+	if enableV3Arb {
+		if ec := ethClientForV3(); ec != nil {
+			ctxH, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			hyPot, hyBuy, hySell, hyOk := hybridV3V2BestProfit(ctxH, ec, quoteTok, wethIn, wethIsT0, u0, u1, s0, s1, gasUSD)
+			cancel()
+			if hyOk && (simPotNet.Sign() <= 0 || hyPot.Cmp(&simPotNet) > 0) {
+				simPotNet.Set(hyPot)
+				buyName, sellName = hyBuy, hySell
+			}
+		}
+	}
+	if simPotNet.Sign() <= 0 {
 		return
 	}
-	profitWei := new(big.Int).Sub(wethBack, wethIn)
-	simProfitUSD := new(big.Rat).Mul(new(big.Rat).SetFrac(profitWei, tenPowU8(18)), ethUsdHint)
-	var simPotNet big.Rat
-	simPotNet.Sub(simProfitUSD, gasUSD)
-
 	var simNetPct big.Rat
 	if ratNotional.Sign() > 0 {
 		var q big.Rat
@@ -1047,7 +1065,7 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 	}
 
 	if spamPrintMode {
-		if midPotNet.Sign() <= 0 {
+		if midPotNet.Sign() <= 0 && simPotNet.Sign() <= 0 {
 			return
 		}
 	} else {
@@ -1794,6 +1812,7 @@ func main() {
 	loadDotEnv()
 	loadNotionalAndEthHint()
 	loadAutoDiscoverSettings()
+	loadV3ArbSettings()
 	loadMinNetProfitPct()
 	loadStatsOpportunityThreshold()
 	spamPrintMode = minNetProfitThreshold.Sign() <= 0
