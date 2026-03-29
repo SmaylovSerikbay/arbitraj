@@ -57,6 +57,11 @@ var (
 	addrBRETT = common.HexToAddress("0x532f27101965dd16442E59d40670FaF5eBB142E4")
 	addrAERO  = common.HexToAddress("0x940181a94A35A4569E4529A3CDfB74e38FD98631")
 	addrcbETH = common.HexToAddress("0x2Ae3F1Ec7F1F5012CFEab0185bfc7aa3cf0DEc22")
+	// «Список спекулянта» — волатильные мемы Base (BaseScan; без пары Uni+Sushi пара не регистрируется).
+	addrMOG    = common.HexToAddress("0x0BA5ED329d073A847Ec3D54aC767f7E099c29bb2") // Based Mog Coin
+	addrKEYCAT = common.HexToAddress("0x9a26f5433671751c3276a065f57e5a02d2817973") // Keyboard Cat
+	addrHIGHER = common.HexToAddress("0x0578d8A44db98B23BF096A382e016e29a5Ce0ffe")
+	addrBENJI  = common.HexToAddress("0xbc45647ea894030a4e9801ec03479739fa2485f0") // Basenji (мем)
 )
 
 const (
@@ -235,6 +240,10 @@ var tokenDecimals = map[common.Address]uint8{
 	addrBRETT: 18,
 	addrAERO:  18,
 	addrcbETH: 18,
+	addrMOG:    18,
+	addrKEYCAT: 18,
+	addrHIGHER: 18,
+	addrBENJI:  18,
 }
 
 func decimalsOf(a common.Address) uint8 {
@@ -259,6 +268,14 @@ var defaultQuoteTokens = []quoteToken{
 	{addrBRETT, "WETH/BRETT"},
 	{addrAERO, "WETH/AERO"},
 	{addrcbETH, "WETH/cbETH"},
+}
+
+// speculatorQuoteTokens — доп. мемы к ручному списку (DEGEN/TOSHI/AERO уже в defaultQuoteTokens).
+var speculatorQuoteTokens = []quoteToken{
+	{addrMOG, "WETH/MOG"},
+	{addrKEYCAT, "WETH/KEYCAT"},
+	{addrHIGHER, "WETH/HIGHER"},
+	{addrBENJI, "WETH/BENJI"},
 }
 
 // --- Pair binding ---
@@ -1203,6 +1220,7 @@ func parseExtraTokenAddresses() []quoteToken {
 
 func bootstrapRegistry(ctx context.Context, ec *ethclient.Client, reg *registry) error {
 	list := append([]quoteToken{}, defaultQuoteTokens...)
+	list = append(list, speculatorQuoteTokens...)
 	list = append(list, parseExtraTokenAddresses()...)
 	var firstErr error
 	registered := 0
