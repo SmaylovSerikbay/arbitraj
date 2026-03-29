@@ -8,6 +8,8 @@
 //
 // Base RPC: BASE_HTTP / BASE_WSS, MIN_NET_PROFIT_PCT, NOTIONAL_USD (размер «банка» для AMM-симуляции),
 // ETH_USD_HINT — грубая цена ETH в USD для перевода $ → WETH и для оценки газа в USD (не оракул).
+// AUTO_DISCOVER (по умолчанию вкл.): скан PairCreated на Uniswap V2, кандидаты с парой на Sushi + min WETH в обоих пулах,
+// до AUTO_PAIR_TARGET пар. AUTO_LOG_BLOCK_SPAN / AUTO_LOG_CHUNK / AUTO_MAX_CANDIDATES / AUTO_MIN_WETH_WEI.
 // Потенциал в логе — после двух свопов x*y=k (комиссия пула 0.3%), минус газ: SuggestGasPrice×GAS_LIMIT_ARB (кэш 12s).
 // NET(sim) > 10% после AMM+газ → [LOW_LIQUIDITY] (подозрение на тонкий пул).
 package main
@@ -22,6 +24,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -86,6 +89,14 @@ var (
 	rat100         = big.NewRat(100, 1)
 
 	notionalUSDForDisplay float64 = 10 // для STATS projection, синхрон с NOTIONAL_USD
+
+	// Авто-поиск WETH-пар по логам Uni V2 (см. loadAutoDiscoverSettings в main).
+	autoDiscoverEnabled  = true
+	autoPairTarget       = 100
+	autoLogBlockSpan     uint64 = 500_000
+	autoLogChunk         uint64 = 2_000
+	autoMaxUniqueQuotes  = 500
+	autoMinWethPerPool   *big.Int // nil = не фильтровать по мин. WETH
 
 	// Динамический газ: SuggestGasPrice × лимит (2 свопа), кэш ~12s; клиент выставляет сессия.
 	gasOracleMu           sync.Mutex
@@ -409,6 +420,170 @@ func (r *registry) getRef(addr common.Address) *addrRef {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.refs[addr]
+}
+
+func (r *registry) hasWETHQuote(quote common.Address) bool {
+	t0, t1 := sortTokens(addrWETH, quote)
+	key := pairKeyString(t0, t1)
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.byKey[key] != nil
+}
+
+// minWETHReserveBothPools — min(WETH-сторона Uni, WETH-сторона Sushi) для WETH/quote; ok=false если нет пула.
+func minWETHReserveBothPools(ctx context.Context, ec *ethclient.Client, quote common.Address) (minWETH *big.Int, ok bool, err error) {
+	t0, _ := sortTokens(addrWETH, quote)
+	wethIsT0 := t0 == addrWETH
+	uniP, err := getPair(ctx, ec, addrUniswapV2Factory, addrWETH, quote)
+	if err != nil {
+		return nil, false, err
+	}
+	sushiP, err := getPair(ctx, ec, addrSushiV2Factory, addrWETH, quote)
+	if err != nil {
+		return nil, false, err
+	}
+	if uniP == (common.Address{}) || sushiP == (common.Address{}) {
+		return nil, false, nil
+	}
+	uniB, err := NewUniswapV2Pair(uniP, ec)
+	if err != nil {
+		return nil, false, err
+	}
+	sushiB, err := NewUniswapV2Pair(sushiP, ec)
+	if err != nil {
+		return nil, false, err
+	}
+	opts := &bind.CallOpts{Context: ctx}
+	r0, r1, _, e1 := uniB.GetReserves(opts)
+	if e1 != nil {
+		return nil, false, e1
+	}
+	uw := wethSideReserve(r0, r1, wethIsT0)
+	r0, r1, _, e2 := sushiB.GetReserves(opts)
+	if e2 != nil {
+		return nil, false, e2
+	}
+	sw := wethSideReserve(r0, r1, wethIsT0)
+	if uw.Cmp(sw) <= 0 {
+		return new(big.Int).Set(uw), true, nil
+	}
+	return new(big.Int).Set(sw), true, nil
+}
+
+// discoverUniWETHQuoteAddresses — уникальные quote из PairCreated на Uniswap V2 (от новых блоков к старым).
+func discoverUniWETHQuoteAddresses(ctx context.Context, ec *ethclient.Client, reg *registry) ([]common.Address, error) {
+	latest, err := ec.BlockNumber(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var fromBlk uint64
+	if latest > autoLogBlockSpan {
+		fromBlk = latest - autoLogBlockSpan
+	}
+	seen := make(map[common.Address]struct{})
+	var quotes []common.Address
+
+	for hi := latest; hi >= fromBlk && len(seen) < autoMaxUniqueQuotes; {
+		lo := hi + 1 - autoLogChunk
+		if lo < fromBlk {
+			lo = fromBlk
+		}
+		logs, err := ec.FilterLogs(ctx, ethereum.FilterQuery{
+			FromBlock: new(big.Int).SetUint64(lo),
+			ToBlock:   new(big.Int).SetUint64(hi),
+			Addresses: []common.Address{addrUniswapV2Factory},
+			Topics:    [][]common.Hash{{pairCreatedTopic}},
+		})
+		if err != nil {
+			log.Printf("AUTO_DISCOVER: FilterLogs %d-%d: %v", lo, hi, err)
+			if lo >= hi {
+				break
+			}
+			hi = lo - 1
+			continue
+		}
+		for _, lg := range logs {
+			t0, t1, _, pok := parsePairCreated(lg)
+			if !pok || !involvesWETH(t0, t1) {
+				continue
+			}
+			q, qok := otherTokenIfWETHPair(t0, t1)
+			if !qok {
+				continue
+			}
+			if reg.hasWETHQuote(q) {
+				continue
+			}
+			if _, dup := seen[q]; dup {
+				continue
+			}
+			seen[q] = struct{}{}
+			quotes = append(quotes, q)
+			if len(seen) >= autoMaxUniqueQuotes {
+				break
+			}
+		}
+		if len(seen) >= autoMaxUniqueQuotes {
+			break
+		}
+		if lo == fromBlk {
+			break
+		}
+		hi = lo - 1
+	}
+	return quotes, nil
+}
+
+func autoDiscoverFillRegistry(ctx context.Context, ec *ethclient.Client, reg *registry) {
+	if !autoDiscoverEnabled {
+		return
+	}
+	if reg.pairCount() >= autoPairTarget {
+		return
+	}
+	quotes, err := discoverUniWETHQuoteAddresses(ctx, ec, reg)
+	if err != nil {
+		log.Printf("AUTO_DISCOVER: скан логов Uni PairCreated: %v", err)
+		return
+	}
+	log.Printf("AUTO_DISCOVER: уникальных кандидатов из логов: %d (оценка ликвидности…)", len(quotes))
+
+	type scored struct {
+		q     common.Address
+		score *big.Int
+	}
+	var rows []scored
+	for _, q := range quotes {
+		if reg.hasWETHQuote(q) {
+			continue
+		}
+		m, ok, err := minWETHReserveBothPools(ctx, ec, q)
+		if err != nil || !ok {
+			continue
+		}
+		if autoMinWethPerPool != nil && m.Cmp(autoMinWethPerPool) < 0 {
+			continue
+		}
+		rows = append(rows, scored{q, m})
+	}
+	sort.Slice(rows, func(i, j int) bool { return rows[i].score.Cmp(rows[j].score) > 0 })
+
+	before := reg.pairCount()
+	for _, row := range rows {
+		if reg.pairCount() >= autoPairTarget {
+			break
+		}
+		if reg.hasWETHQuote(row.q) {
+			continue
+		}
+		label := "WETH/" + row.q.Hex()[:10] + "…"
+		_, err := reg.tryRegisterWETHPair(ctx, ec, row.q, label, autoMinWethPerPool)
+		if err != nil {
+			log.Printf("AUTO_DISCOVER: %s: %v", label, err)
+		}
+	}
+	addedN := reg.pairCount() - before
+	log.Printf("AUTO_DISCOVER: добавлено пар: %d (всего %d, цель %d)", addedN, reg.pairCount(), autoPairTarget)
 }
 
 // getAmountOut — constant product + комиссия пула 0.3% (997/1000). Невалидные входы → 0.
@@ -736,7 +911,7 @@ func getPair(ctx context.Context, ec *ethclient.Client, factory, a, b common.Add
 	return pair, nil
 }
 
-func (r *registry) tryRegisterWETHPair(ctx context.Context, ec *ethclient.Client, quote common.Address, label string) (added bool, err error) {
+func (r *registry) tryRegisterWETHPair(ctx context.Context, ec *ethclient.Client, quote common.Address, label string, minWethPerPool *big.Int) (added bool, err error) {
 	t0, t1 := sortTokens(addrWETH, quote)
 	key := pairKeyString(t0, t1)
 
@@ -805,6 +980,16 @@ func (r *registry) tryRegisterWETHPair(ctx context.Context, ec *ethclient.Client
 	tp.sushiR1.Set(r1)
 	atomic.StoreUint32(&tp.haveSushi, 1)
 
+	if minWethPerPool != nil && minWethPerPool.Sign() > 0 {
+		wIsT0 := tp.token0 == addrWETH
+		uw := wethSideReserve(tp.uniR0, tp.uniR1, wIsT0)
+		sw := wethSideReserve(tp.sushiR0, tp.sushiR1, wIsT0)
+		if uw.Cmp(minWethPerPool) < 0 || sw.Cmp(minWethPerPool) < 0 {
+			r.mu.Unlock()
+			return false, nil
+		}
+	}
+
 	r.byKey[key] = tp
 	r.refs[uniP] = &addrRef{tp, true}
 	r.refs[sushiP] = &addrRef{tp, false}
@@ -845,7 +1030,7 @@ func bootstrapRegistry(ctx context.Context, ec *ethclient.Client, reg *registry)
 	var firstErr error
 	registered := 0
 	for _, q := range list {
-		added, err := reg.tryRegisterWETHPair(ctx, ec, q.addr, q.symbol)
+		added, err := reg.tryRegisterWETHPair(ctx, ec, q.addr, q.symbol, autoMinWethPerPool)
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -853,10 +1038,11 @@ func bootstrapRegistry(ctx context.Context, ec *ethclient.Client, reg *registry)
 			registered++
 		}
 	}
-	if registered == 0 && firstErr != nil {
-		return firstErr
-	}
+	autoDiscoverFillRegistry(ctx, ec, reg)
 	if reg.pairCount() == 0 {
+		if firstErr != nil {
+			return firstErr
+		}
 		return errors.New("ни одна WETH-пара не найдена на обоих DEX (getPair пустой)")
 	}
 	log.Printf("старт: отслеживаем %d пар (пулов в Sync: %d)", reg.pairCount(), reg.poolAddressCount())
@@ -900,7 +1086,7 @@ func (r *registry) handlePairCreated(ctx context.Context, ec *ethclient.Client, 
 		return
 	}
 	label := "WETH/" + quote.Hex()[:10] + "…"
-	added, err := r.tryRegisterWETHPair(ctx, ec, quote, label)
+	added, err := r.tryRegisterWETHPair(ctx, ec, quote, label, autoMinWethPerPool)
 	if err != nil {
 		log.Printf("PairCreated: регистрация %s: %v", label, err)
 		return
@@ -1254,6 +1440,57 @@ func loadStatsOpportunityThreshold() {
 	log.Printf("STATS_OPPORTUNITY_THRESHOLD_PCT: не разобран %q, остаётся 0.5", s)
 }
 
+func loadAutoDiscoverSettings() {
+	s := strings.TrimSpace(strings.ToLower(os.Getenv("AUTO_DISCOVER")))
+	if s == "0" || s == "false" || s == "off" {
+		autoDiscoverEnabled = false
+		log.Printf("AUTO_DISCOVER выключен — только defaultQuoteTokens + WETH_EXTRA_TOKENS")
+		return
+	}
+	autoDiscoverEnabled = true
+	if v := strings.TrimSpace(os.Getenv("AUTO_PAIR_TARGET")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			autoPairTarget = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("AUTO_LOG_BLOCK_SPAN")); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil && n > 0 {
+			autoLogBlockSpan = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("AUTO_LOG_CHUNK")); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil && n >= 100 {
+			autoLogChunk = n
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("AUTO_MAX_CANDIDATES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			autoMaxUniqueQuotes = n
+		}
+	}
+	mw := strings.TrimSpace(os.Getenv("AUTO_MIN_WETH_WEI"))
+	switch mw {
+	case "0":
+		autoMinWethPerPool = nil
+	case "":
+		autoMinWethPerPool = big.NewInt(100_000_000_000_000_000) // 0.1 WETH на каждый пул
+	default:
+		bi := new(big.Int)
+		if _, ok := bi.SetString(mw, 10); ok && bi.Sign() > 0 {
+			autoMinWethPerPool = bi
+		} else {
+			autoMinWethPerPool = big.NewInt(100_000_000_000_000_000)
+			log.Printf("AUTO_MIN_WETH_WEI: не разобран %q, остаётся 0.1 WETH", mw)
+		}
+	}
+	minLabel := "выкл"
+	if autoMinWethPerPool != nil {
+		minLabel = new(big.Rat).SetFrac(autoMinWethPerPool, tenPowU8(18)).FloatString(4) + " WETH/пул"
+	}
+	log.Printf("AUTO_DISCOVER: цель %d пар | глубина логов ~%d блоков | чанк %d | кандидатов ≤%d | min ликв. %s",
+		autoPairTarget, autoLogBlockSpan, autoLogChunk, autoMaxUniqueQuotes, minLabel)
+}
+
 func loadNotionalAndEthHint() {
 	s := strings.TrimSpace(os.Getenv("NOTIONAL_USD"))
 	if s != "" {
@@ -1296,6 +1533,7 @@ func loadDotEnv() {
 func main() {
 	loadDotEnv()
 	loadNotionalAndEthHint()
+	loadAutoDiscoverSettings()
 	loadMinNetProfitPct()
 	loadStatsOpportunityThreshold()
 	spamPrintMode = minNetProfitThreshold.Sign() <= 0
