@@ -238,6 +238,12 @@ func printStatsSummaryBlock() {
 			formatWithCommas(hyUp),
 			formatWithCommas(hyPos),
 		)
+		ev, wV3V3, wAero := v3OnlyTelemetrySnapshot()
+		fmt.Printf("V3-only routes: eval %s | wins V3↔V3 %s | wins V3↔Aero %s\n",
+			formatWithCommas(ev),
+			formatWithCommas(wV3V3),
+			formatWithCommas(wAero),
+		)
 	}
 	fmt.Println("====================================================")
 }

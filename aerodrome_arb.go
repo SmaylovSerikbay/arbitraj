@@ -6,6 +6,7 @@ import (
 	"math/big"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -27,6 +28,13 @@ var (
 	aeroFactoryParsed abi.ABI
 	aeroPoolParsed    abi.ABI
 	enableAeroArb     = true
+)
+
+// V3-only route telemetry (atomic).
+var (
+	v3OnlyEvalCalls  uint64
+	v3OnlyV3V3Wins   uint64
+	v3OnlyV3AeroWins uint64
 )
 
 func init() {
@@ -185,23 +193,38 @@ func bestV3OnlyProfit(
 	wethIn *big.Int,
 	baseGasUSD *big.Rat,
 ) (potNet *big.Rat, buyName, sellName string, ok bool) {
+	atomic.AddUint64(&v3OnlyEvalCalls, 1)
 	var best *big.Rat
 	var bb, ss string
+	var bestRoute string
 
 	if p, b, s, ok := v3V3BestProfit(ctx, ec, quote, wethIn, baseGasUSD); ok && p != nil && p.Sign() > 0 {
 		best = p
 		bb, ss = b, s
+		bestRoute = "v3v3"
 	}
 	if enableAeroArb {
 		if p, b, s, ok := v3AeroHybridBestProfit(ctx, ec, quote, wethIn, baseGasUSD); ok && p != nil && p.Sign() > 0 {
 			if best == nil || p.Cmp(best) > 0 {
 				best = p
 				bb, ss = b, s
+				bestRoute = "v3aero"
 			}
 		}
 	}
 	if best == nil || best.Sign() <= 0 {
 		return nil, "", "", false
 	}
+	if bestRoute == "v3v3" {
+		atomic.AddUint64(&v3OnlyV3V3Wins, 1)
+	} else if bestRoute == "v3aero" {
+		atomic.AddUint64(&v3OnlyV3AeroWins, 1)
+	}
 	return best, bb, ss, true
+}
+
+func v3OnlyTelemetrySnapshot() (evals, v3v3, v3aero uint64) {
+	return atomic.LoadUint64(&v3OnlyEvalCalls),
+		atomic.LoadUint64(&v3OnlyV3V3Wins),
+		atomic.LoadUint64(&v3OnlyV3AeroWins)
 }
