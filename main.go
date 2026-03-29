@@ -94,7 +94,8 @@ var (
 	autoDiscoverEnabled  = true
 	autoPairTarget       = 100
 	autoLogBlockSpan        uint64        = 500_000
-	autoLogChunk            uint64        = 800 // меньше чанк — меньше CU за запрос (Alchemy)
+	// Дефолт 10 — лимит Alchemy Free на getLogs; на PAYG можно AUTO_LOG_CHUNK=500–2000
+	autoLogChunk            uint64        = 10
 	autoLogThrottle         time.Duration = 450 * time.Millisecond // пауза между успешными чанками
 	autoLogRetryInitial     time.Duration = 2 * time.Second        // первая пауза при CU/s limit
 	autoScoreThrottle       time.Duration = 35 * time.Millisecond // между оценками ликвидности (getReserves)
@@ -486,6 +487,53 @@ func isRPCThroughputErr(err error) bool {
 		strings.Contains(m, "rate limit")
 }
 
+// Лимит диапазона getLogs (Alchemy Free: до 10 блоков за запрос).
+var (
+	getLogsLimitMu       sync.Mutex
+	getLogsMaxBlockSpan  uint64 // 0 — провайдер ещё не сообщил; иначе min с AUTO_LOG_CHUNK
+	getLogsLimitLogged   sync.Once
+)
+
+func isGetLogsBlockRangeLimitErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := strings.ToLower(err.Error())
+	return strings.Contains(m, "free tier") ||
+		strings.Contains(m, "10 block") ||
+		(strings.Contains(m, "block range") && strings.Contains(m, "getlogs"))
+}
+
+func noteGetLogsBlockRangeCap(err error) {
+	if !isGetLogsBlockRangeLimitErr(err) {
+		return
+	}
+	getLogsLimitMu.Lock()
+	if getLogsMaxBlockSpan == 0 || getLogsMaxBlockSpan > 10 {
+		getLogsMaxBlockSpan = 10
+	}
+	getLogsLimitMu.Unlock()
+	getLogsLimitLogged.Do(func() {
+		log.Printf("AUTO_DISCOVER: провайдер ограничил getLogs по длине диапазона (часто Alchemy Free ≤10 блоков) — чанки режутся автоматически; большие AUTO_LOG_CHUNK нужен PAYG/другой RPC")
+	})
+}
+
+func effectiveLogChunk() uint64 {
+	getLogsLimitMu.Lock()
+	capSpan := getLogsMaxBlockSpan
+	getLogsLimitMu.Unlock()
+	if capSpan == 0 {
+		if autoLogChunk < 1 {
+			return 1
+		}
+		return autoLogChunk
+	}
+	if autoLogChunk < capSpan {
+		return autoLogChunk
+	}
+	return capSpan
+}
+
 func filterLogsUniPairCreated(ctx context.Context, ec *ethclient.Client, lo, hi uint64) ([]types.Log, error) {
 	return ec.FilterLogs(ctx, ethereum.FilterQuery{
 		FromBlock: new(big.Int).SetUint64(lo),
@@ -513,6 +561,7 @@ func fetchUniPairCreatedChunk(ctx context.Context, ec *ethclient.Client, lo, hi 
 		}
 		lastErr = err
 		if !isRPCThroughputErr(err) {
+			noteGetLogsBlockRangeCap(err)
 			return nil, err
 		}
 		if !loggedThrottle {
@@ -532,7 +581,7 @@ func fetchUniPairCreatedChunk(ctx context.Context, ec *ethclient.Client, lo, hi 
 	return nil, lastErr
 }
 
-// fetchUniPairCreatedLogs: один чанк или рекурсивное деление при упорном throughput-ошибке.
+// fetchUniPairCreatedLogs: один запрос или рекурсивное деление, пока диапазон > effectiveLogChunk() (Free Alchemy: 10).
 func fetchUniPairCreatedLogs(ctx context.Context, ec *ethclient.Client, lo, hi uint64) ([]types.Log, error) {
 	if lo > hi {
 		return nil, nil
@@ -541,11 +590,11 @@ func fetchUniPairCreatedLogs(ctx context.Context, ec *ethclient.Client, lo, hi u
 	if err == nil {
 		return logs, nil
 	}
-	if !isRPCThroughputErr(err) || lo >= hi {
-		return nil, err
-	}
-	// Слишком узкий диапазон — не делим бесконечно
-	if hi-lo+1 <= 80 {
+	noteGetLogsBlockRangeCap(err)
+
+	eff := effectiveLogChunk()
+	span := hi - lo + 1
+	if span <= eff || lo >= hi {
 		return nil, err
 	}
 	mid := lo + (hi-lo)/2
@@ -596,13 +645,19 @@ func discoverUniWETHQuoteAddresses(ctx context.Context, ec *ethclient.Client, re
 	var quotes []common.Address
 
 	for hi := latest; hi >= fromBlk && len(seen) < autoMaxUniqueQuotes; {
-		lo := hi + 1 - autoLogChunk
+		span := effectiveLogChunk()
+		if span < 1 {
+			span = 1
+		}
+		lo := hi + 1 - span
 		if lo < fromBlk {
 			lo = fromBlk
 		}
 		logs, err := fetchUniPairCreatedLogs(ctx, ec, lo, hi)
 		if err != nil {
-			log.Printf("AUTO_DISCOVER: FilterLogs %d-%d окончательно: %v", lo, hi, err)
+			if !isGetLogsBlockRangeLimitErr(err) {
+				log.Printf("AUTO_DISCOVER: FilterLogs %d-%d окончательно: %v", lo, hi, err)
+			}
 			if lo >= hi {
 				break
 			}
@@ -1581,7 +1636,7 @@ func loadAutoDiscoverSettings() {
 		}
 	}
 	if v := strings.TrimSpace(os.Getenv("AUTO_LOG_CHUNK")); v != "" {
-		if n, err := strconv.ParseUint(v, 10, 64); err == nil && n >= 100 {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil && n >= 1 {
 			autoLogChunk = n
 		}
 	}
