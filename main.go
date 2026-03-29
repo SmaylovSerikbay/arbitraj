@@ -6,8 +6,10 @@
 // Бумажный режим: нет on-chain проверок на honeypot/налог 99%% — смотрите только как справочную
 // картину; в бой без симуляции sell и аудита контракта нельзя.
 //
-// Base RPC: BASE_HTTP / BASE_WSS, MIN_NET_PROFIT_PCT (≤0 = тест «вшивости», печать микроспредов),
-// STATS_OPPORTUNITY_THRESHOLD_PCT — порог учёта «оппортьюнити» в сводке (по умолчанию 0.5%% net).
+// Base RPC: BASE_HTTP / BASE_WSS, MIN_NET_PROFIT_PCT, NOTIONAL_USD (размер «банка» для AMM-симуляции),
+// ETH_USD_HINT — грубая цена ETH в USD для перевода $ → WETH и для оценки газа в USD (не оракул).
+// Потенциал в логе — после двух свопов x*y=k (комиссия пула 0.3%), минус газ: SuggestGasPrice×GAS_LIMIT_ARB (кэш 12s).
+// NET(sim) > 10% после AMM+газ → [LOW_LIQUIDITY] (подозрение на тонкий пул).
 package main
 
 import (
@@ -20,6 +22,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -57,8 +60,7 @@ const (
 	reconnectMinDelay     = 2 * time.Second
 	reconnectMaxDelay     = 60 * time.Second
 	heartbeatInterval     = 1 * time.Minute
-	statsSummaryInterval  = 10 * time.Minute
-	notionalUSDForDisplay = 1000.0 // как ratNotional, для строки projection
+	statsSummaryInterval = 10 * time.Minute
 )
 
 // Фабрика: getPair + PairCreated (одинаковый ABI Uni/Sushi V2).
@@ -77,11 +79,27 @@ var (
 	minNetProfitThreshold        *big.Rat
 	statsOpportunityThreshold    *big.Rat // net-% ≥ этого попадает в счётчик «оппортьюнити» (по умолчанию 0.5%)
 	spamPrintMode                bool     // MIN_NET_PROFIT_PCT ≤ 0
-	ratSwapFeesPct               = big.NewRat(6, 10)
-	ratGasUSD             = big.NewRat(5, 100)
-	ratNotional           = big.NewRat(1000, 1)
-	rat100                = big.NewRat(100, 1)
+	ratSwapFeesPct = big.NewRat(6, 10)
+	ratGasUSD      = big.NewRat(5, 100) // фоллбэк, если RPC недоступен
+	ratNotional    = big.NewRat(10, 1)   // перезапись в loadNotionalAndEthHint (по умолчанию $10)
+	ethUsdHint     = big.NewRat(2500, 1) // подсказка для $ → WETH; перезапись из ETH_USD_HINT
+	rat100         = big.NewRat(100, 1)
+
+	notionalUSDForDisplay float64 = 10 // для STATS projection, синхрон с NOTIONAL_USD
+
+	// Динамический газ: SuggestGasPrice × лимит (2 свопа), кэш ~12s; клиент выставляет сессия.
+	gasOracleMu           sync.Mutex
+	gasOracleClient       *ethclient.Client
+	gasCostUSDCache       *big.Rat
+	gasOracleUpdated      time.Time
+	gasOracleTTL          = 12 * time.Second
+	gasLimitTwoSwaps int64 = 300_000 // ~2 свопа на Base; переопределение GAS_LIMIT_ARB
+
+	lowLiqPrintMu sync.Mutex
+	lowLiqPrintAt map[string]time.Time // антиспам для [LOW_LIQUIDITY]
 )
+
+const lowLiquiditySuspiciousNetPct = 10.0 // net% после AMM+газ — выше считаем «тонкой» ликвидностью
 
 func init() {
 	var err error
@@ -393,6 +411,133 @@ func (r *registry) getRef(addr common.Address) *addrRef {
 	return r.refs[addr]
 }
 
+// getAmountOut — constant product + комиссия пула 0.3% (997/1000). Невалидные входы → 0.
+func getAmountOut(amountIn, reserveIn, reserveOut *big.Int) *big.Int {
+	if amountIn == nil || reserveIn == nil || reserveOut == nil {
+		return big.NewInt(0)
+	}
+	if amountIn.Sign() <= 0 || reserveIn.Sign() <= 0 || reserveOut.Sign() <= 0 {
+		return big.NewInt(0)
+	}
+	amountInWithFee := new(big.Int).Mul(amountIn, big.NewInt(997))
+	numerator := new(big.Int).Mul(amountInWithFee, reserveOut)
+	denominator := new(big.Int).Add(new(big.Int).Mul(reserveIn, big.NewInt(1000)), amountInWithFee)
+	if denominator.Sign() == 0 {
+		return big.NewInt(0)
+	}
+	return new(big.Int).Div(numerator, denominator)
+}
+
+func setGasOracleClient(c *ethclient.Client) {
+	gasOracleMu.Lock()
+	defer gasOracleMu.Unlock()
+	gasOracleClient = c
+	gasCostUSDCache = nil
+	gasOracleUpdated = time.Time{}
+}
+
+func arbGasLimitWeiMultiplier() *big.Int {
+	s := strings.TrimSpace(os.Getenv("GAS_LIMIT_ARB"))
+	if s != "" {
+		if v, err := strconv.ParseInt(s, 10, 64); err == nil && v > 0 {
+			return big.NewInt(v)
+		}
+	}
+	return big.NewInt(gasLimitTwoSwaps)
+}
+
+// dynamicGasUSD: gasPrice × GAS_LIMIT_ARB × ETH_USD_HINT / 1e18; при отсутствии RPC — ratGasUSD.
+func dynamicGasUSD() *big.Rat {
+	gasOracleMu.Lock()
+	c := gasOracleClient
+	cache := gasCostUSDCache
+	upd := gasOracleUpdated
+	gasOracleMu.Unlock()
+	if c == nil {
+		return new(big.Rat).Set(ratGasUSD)
+	}
+	if cache != nil && time.Since(upd) < gasOracleTTL {
+		return new(big.Rat).Set(cache)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+	defer cancel()
+	gp, err := c.SuggestGasPrice(ctx)
+	if err != nil || gp == nil || gp.Sign() <= 0 {
+		gp = big.NewInt(20_000_000) // ~0.02 gwei фоллбэк
+	}
+	gasWei := new(big.Int).Mul(gp, arbGasLimitWeiMultiplier())
+	usd := new(big.Rat).SetFrac(gasWei, tenPowU8(18))
+	usd.Mul(usd, ethUsdHint)
+	gasOracleMu.Lock()
+	gasCostUSDCache = new(big.Rat).Set(usd)
+	gasOracleUpdated = time.Now()
+	gasOracleMu.Unlock()
+	return new(big.Rat).Set(usd)
+}
+
+func shouldPrintLowLiquidity(pairLabel string) bool {
+	lowLiqPrintMu.Lock()
+	defer lowLiqPrintMu.Unlock()
+	if lowLiqPrintAt == nil {
+		lowLiqPrintAt = make(map[string]time.Time)
+	}
+	if t, ok := lowLiqPrintAt[pairLabel]; ok && time.Since(t) < 3*time.Second {
+		return false
+	}
+	lowLiqPrintAt[pairLabel] = time.Now()
+	return true
+}
+
+func ratFloorInt(r *big.Rat) *big.Int {
+	if r == nil || r.Sign() <= 0 {
+		return big.NewInt(0)
+	}
+	return new(big.Int).Div(r.Num(), r.Denom())
+}
+
+// notionalUSDToWETHWei: USD * 1e18 / ETH_USD_HINT
+func notionalUSDToWETHWei() *big.Int {
+	num := new(big.Rat).Mul(ratNotional, new(big.Rat).SetInt(tenPowU8(18)))
+	num.Quo(num, ethUsdHint)
+	return ratFloorInt(num)
+}
+
+// Симуляция: WETH -> X на «buy» пуле, X -> WETH на «sell» пуле. buySushi=true — сначала Sushi.
+func simulateWETHRoundTrip(
+	wethIsToken0 bool,
+	buyR0, buyR1, sellR0, sellR1 *big.Int,
+	wethIn *big.Int,
+) (wethBack *big.Int, ok bool) {
+	if wethIn == nil || wethIn.Sign() <= 0 {
+		return nil, false
+	}
+	var xOut *big.Int
+	if wethIsToken0 {
+		xOut = getAmountOut(wethIn, buyR0, buyR1)
+		if xOut.Sign() <= 0 {
+			return nil, false
+		}
+		wethBack = getAmountOut(xOut, sellR1, sellR0)
+	} else {
+		xOut = getAmountOut(wethIn, buyR1, buyR0)
+		if xOut.Sign() <= 0 {
+			return nil, false
+		}
+		wethBack = getAmountOut(xOut, sellR0, sellR1)
+	}
+	if wethBack == nil || wethBack.Sign() <= 0 {
+		return nil, false
+	}
+	return wethBack, true
+}
+
+func wethSideReserve(r0, r1 *big.Int, wethIsToken0 bool) *big.Int {
+	if wethIsToken0 {
+		return new(big.Int).Set(r0)
+	}
+	return new(big.Int).Set(r1)
+}
+
 // Цена token1 за 1 token0 (как в пуле): (r1 * 10^dec0) / (r0 * 10^dec1).
 func ratPriceToken1PerToken0(r0, r1 *big.Int, dec0, dec1 uint8, out *big.Rat) {
 	if r0.Sign() == 0 {
@@ -408,10 +553,19 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 	if atomic.LoadUint32(&tp.haveUni) == 0 || atomic.LoadUint32(&tp.haveSushi) == 0 {
 		return
 	}
+	if tp.token0 != addrWETH && tp.token1 != addrWETH {
+		return
+	}
+	wethIsT0 := tp.token0 == addrWETH
+
 	tp.mu.Lock()
 	var pUni, pSushi big.Rat
 	ratPriceToken1PerToken0(tp.uniR0, tp.uniR1, tp.dec0, tp.dec1, &pUni)
 	ratPriceToken1PerToken0(tp.sushiR0, tp.sushiR1, tp.dec0, tp.dec1, &pSushi)
+	u0 := new(big.Int).Set(tp.uniR0)
+	u1 := new(big.Int).Set(tp.uniR1)
+	s0 := new(big.Int).Set(tp.sushiR0)
+	s1 := new(big.Int).Set(tp.sushiR1)
 	tp.mu.Unlock()
 
 	if pUni.Cmp(&pSushi) == 0 {
@@ -428,7 +582,7 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 		minP.Set(&pUni)
 		buyName, sellName = "UniswapV2", "SushiSwap"
 	}
-	var diff, spreadQuo, spreadPct, afterFees, netPct big.Rat
+	var diff, spreadQuo, spreadPct, afterFees big.Rat
 	diff.Sub(&maxP, &minP)
 	if minP.Sign() == 0 {
 		return
@@ -436,22 +590,70 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 	spreadQuo.Quo(&diff, &minP)
 	spreadPct.Mul(&spreadQuo, rat100)
 	afterFees.Sub(&spreadPct, ratSwapFeesPct)
-	var grossUSD, beforeGas, potNet big.Rat
-	grossUSD.Mul(ratNotional, &afterFees)
-	beforeGas.Quo(&grossUSD, rat100)
-	potNet.Sub(&beforeGas, ratGasUSD)
-	if potNet.Sign() <= 0 {
+
+	// «Mid» потенциал (как раньше) — только справочно, без слиппеджа AMM.
+	gasUSD := dynamicGasUSD()
+	var midGross, midBeforeGas, midPotNet, midNetPct big.Rat
+	midGross.Mul(ratNotional, &afterFees)
+	midBeforeGas.Quo(&midGross, rat100)
+	midPotNet.Sub(&midBeforeGas, gasUSD)
+	if midPotNet.Sign() <= 0 {
 		return
 	}
-	var netQuo big.Rat
-	netQuo.Quo(&potNet, ratNotional)
-	netPct.Mul(&netQuo, rat100)
+	var midNetQuo big.Rat
+	midNetQuo.Quo(&midPotNet, ratNotional)
+	midNetPct.Mul(&midNetQuo, rat100)
 
-	netF, _ := netPct.Float64()
-	potF, _ := potNet.Float64()
+	var buyR0, buyR1, sellR0, sellR1 *big.Int
+	if buyName == "SushiSwap" {
+		buyR0, buyR1, sellR0, sellR1 = s0, s1, u0, u1
+	} else {
+		buyR0, buyR1, sellR0, sellR1 = u0, u1, s0, s1
+	}
 
-	// Учёт в сводке: net ≥ порога STATS, не чаще 1 раза / 5s на пару (иначе Sync задублирует счётчик).
-	if netPct.Cmp(statsOpportunityThreshold) >= 0 {
+	wethIn := notionalUSDToWETHWei()
+	if wethIn.Sign() <= 0 {
+		return
+	}
+	wethSideBuy := wethSideReserve(buyR0, buyR1, wethIsT0)
+	maxWethIn := new(big.Int).Div(wethSideBuy, big.NewInt(10))
+	if maxWethIn.Sign() > 0 && wethIn.Cmp(maxWethIn) > 0 {
+		wethIn = new(big.Int).Set(maxWethIn)
+	}
+
+	wethBack, simOK := simulateWETHRoundTrip(wethIsT0, buyR0, buyR1, sellR0, sellR1, wethIn)
+	if !simOK {
+		return
+	}
+	profitWei := new(big.Int).Sub(wethBack, wethIn)
+	simProfitUSD := new(big.Rat).Mul(new(big.Rat).SetFrac(profitWei, tenPowU8(18)), ethUsdHint)
+	var simPotNet big.Rat
+	simPotNet.Sub(simProfitUSD, gasUSD)
+
+	var simNetPct big.Rat
+	if ratNotional.Sign() > 0 {
+		var q big.Rat
+		q.Quo(&simPotNet, ratNotional)
+		simNetPct.Mul(&q, rat100)
+	}
+
+	simNetF, _ := simNetPct.Float64()
+	simPotF, _ := simPotNet.Float64()
+	midNetF, _ := midNetPct.Float64()
+	midPotF, _ := midPotNet.Float64()
+
+	// Подозрительно высокий net после AMM+газ — типичный признак «фейкового» спреда на тонкой ликвидности.
+	if simPotNet.Sign() > 0 && simNetF > lowLiquiditySuspiciousNetPct {
+		if shouldPrintLowLiquidity(tp.label) {
+			ts := time.Now().Format("15:04:05.000")
+			fmt.Printf("[%s] [LOW_LIQUIDITY] %s | BUY: %s | SELL: %s | NET(sim)=%.3f%% (~$%.2f) — вероятно иллюзия mid/тонкий пул\n",
+				ts, tp.label, buyName, sellName, simNetF, simPotF)
+		}
+		return
+	}
+
+	// Сводка: только исполнимый по симуляции профит
+	if simPotNet.Sign() > 0 && simNetPct.Cmp(statsOpportunityThreshold) >= 0 {
 		tp.statMu.Lock()
 		allow := time.Since(tp.lastOppSampleAt) >= 5*time.Second
 		if allow {
@@ -459,23 +661,41 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 		}
 		tp.statMu.Unlock()
 		if allow {
-			appStats.recordOpportunity(potF, tp.label)
+			appStats.recordOpportunity(simPotF, tp.label)
 		}
 	}
 
-	if !spamPrintMode {
-		if netPct.Cmp(minNetProfitThreshold) <= 0 {
+	if spamPrintMode {
+		if midPotNet.Sign() <= 0 {
+			return
+		}
+	} else {
+		if simPotNet.Sign() <= 0 {
+			return
+		}
+		if simNetPct.Cmp(minNetProfitThreshold) <= 0 {
 			return
 		}
 	}
-	// spamPrintMode (MIN≤0): печатаем любой положительный potNet после комиссий/газа — для теста WebSocket/математики
 
-	if !shouldPrint(netF, buyName, sellName, tp.label, spamPrintMode) {
+	printNet := simNetF
+	if spamPrintMode && simPotNet.Sign() <= 0 {
+		printNet = midNetF
+	}
+
+	if !shouldPrint(printNet, buyName, sellName, tp.label, spamPrintMode) {
 		return
 	}
 	ts := time.Now().Format("15:04:05.000")
-	fmt.Printf("[%s] PROFIT FOUND: %.3f%% | %s | BUY: %s | SELL: %s | POTENTIAL: $%.2f\n",
-		ts, netF, tp.label, buyName, sellName, potF)
+	nf, _ := ratNotional.Float64()
+	if spamPrintMode && simPotNet.Sign() <= 0 {
+		fmt.Printf("[%s] PROFIT FOUND: %.3f%% (mid-only) | %s | BUY: %s | SELL: %s | mid-ref: $%.2f | SIM $%.0f: убыток/ноль после AMM+газ (слиппедж/низкая ликв.)\n",
+			ts, midNetF, tp.label, buyName, sellName, midPotF, nf)
+		return
+	}
+	gasF, _ := gasUSD.Float64()
+	fmt.Printf("[%s] PROFIT FOUND: %.3f%% NET(sim,$%.0f AMM+gas~$%.4f) | %s | BUY: %s | SELL: %s | POTENTIAL: $%.2f | mid-ref (без слиппеджа): $%.2f\n",
+		ts, simNetF, nf, gasF, tp.label, buyName, sellName, simPotF, midPotF)
 }
 
 var printMu sync.Mutex
@@ -857,6 +1077,8 @@ func runSessionWebSocket(ctx context.Context, wssURL, httpURL string, splitHTTP 
 		callCli = hc
 	}
 	ecCall, _ := callCli.(*ethclient.Client)
+	setGasOracleClient(ecCall)
+	defer setGasOracleClient(nil)
 
 	reg := newRegistry()
 	if err := bootstrapRegistry(ctx, ecCall, reg); err != nil {
@@ -900,6 +1122,8 @@ func runSessionHTTPPoll(ctx context.Context, httpURL string) error {
 		return err
 	}
 	defer ec.Close()
+	setGasOracleClient(ec)
+	defer setGasOracleClient(nil)
 	reg := newRegistry()
 	if err := bootstrapRegistry(ctx, ec, reg); err != nil {
 		return err
@@ -1030,6 +1254,32 @@ func loadStatsOpportunityThreshold() {
 	log.Printf("STATS_OPPORTUNITY_THRESHOLD_PCT: не разобран %q, остаётся 0.5", s)
 }
 
+func loadNotionalAndEthHint() {
+	s := strings.TrimSpace(os.Getenv("NOTIONAL_USD"))
+	if s != "" {
+		r := new(big.Rat)
+		if _, ok := r.SetString(s); ok && r.Sign() > 0 {
+			ratNotional = r
+			if f, _ := r.Float64(); f > 0 {
+				notionalUSDForDisplay = f
+			}
+			log.Printf("NOTIONAL_USD=%s (размер сделки в AMM-симуляции)", r.FloatString(2))
+		} else {
+			log.Printf("NOTIONAL_USD: не разобран %q, остаётся 10", s)
+		}
+	}
+	h := strings.TrimSpace(os.Getenv("ETH_USD_HINT"))
+	if h != "" {
+		r := new(big.Rat)
+		if _, ok := r.SetString(h); ok && r.Sign() > 0 {
+			ethUsdHint = r
+			log.Printf("ETH_USD_HINT=%s ($ → WETH в симуляции)", r.FloatString(2))
+		} else {
+			log.Printf("ETH_USD_HINT: не разобран %q, остаётся 2500", h)
+		}
+	}
+}
+
 func loadDotEnv() {
 	try := []string{".env"}
 	if exe, err := os.Executable(); err == nil {
@@ -1045,6 +1295,7 @@ func loadDotEnv() {
 
 func main() {
 	loadDotEnv()
+	loadNotionalAndEthHint()
 	loadMinNetProfitPct()
 	loadStatsOpportunityThreshold()
 	spamPrintMode = minNetProfitThreshold.Sign() <= 0
