@@ -93,7 +93,7 @@ var (
 	// Авто-поиск WETH-пар по логам Uni V2 (см. loadAutoDiscoverSettings в main).
 	autoDiscoverEnabled  = true
 	autoPairTarget       = 100
-	autoLogBlockSpan        uint64        = 500_000
+	autoLogBlockSpan        uint64        = 80_000 // фоновый скан; на Free Alchemy не раздувайте без нужды
 	// Дефолт 10 — лимит Alchemy Free на getLogs; на PAYG можно AUTO_LOG_CHUNK=500–2000
 	autoLogChunk            uint64        = 10
 	autoLogThrottle         time.Duration = 450 * time.Millisecond // пауза между успешными чанками
@@ -1215,15 +1215,33 @@ func bootstrapRegistry(ctx context.Context, ec *ethclient.Client, reg *registry)
 			registered++
 		}
 	}
-	autoDiscoverFillRegistry(ctx, ec, reg)
 	if reg.pairCount() == 0 {
 		if firstErr != nil {
 			return firstErr
 		}
 		return errors.New("ни одна WETH-пара не найдена на обоих DEX (getPair пустой)")
 	}
-	log.Printf("старт: отслеживаем %d пар (пулов в Sync: %d)", reg.pairCount(), reg.poolAddressCount())
+	log.Printf("старт (ручной список): %d пар | пулов Sync: %d | AUTO_DISCOVER пойдёт в фоне", reg.pairCount(), reg.poolAddressCount())
 	return nil
+}
+
+// autoDiscoverBackground — тяжёлый getLogs-скан не блокирует подключение WebSocket/Sync.
+func autoDiscoverBackground(ctx context.Context, ec *ethclient.Client, reg *registry, bump chan struct{}) {
+	if !autoDiscoverEnabled {
+		return
+	}
+	if reg.pairCount() >= autoPairTarget {
+		return
+	}
+	log.Printf("AUTO_DISCOVER: фоновый скан PairCreated (~%d блоков назад)…", autoLogBlockSpan)
+	autoDiscoverFillRegistry(ctx, ec, reg)
+	if bump != nil {
+		select {
+		case bump <- struct{}{}:
+		default:
+		}
+	}
+	log.Printf("AUTO_DISCOVER: фон завершён — сейчас %d пар (цель %d), пулов Sync: %d", reg.pairCount(), autoPairTarget, reg.poolAddressCount())
 }
 
 func parsePairCreated(log types.Log) (token0, token1, pair common.Address, ok bool) {
@@ -1452,6 +1470,8 @@ func runSessionWebSocket(ctx context.Context, wssURL, httpURL string, splitHTTP 
 	defer cancel()
 
 	bump := make(chan struct{}, 1)
+	go autoDiscoverBackground(innerCtx, ecCall, reg, bump)
+
 	errPC := make(chan error, 1)
 	go func() { errPC <- listenPairCreated(innerCtx, wsCli, reg, bump) }()
 	errSY := make(chan error, 1)
@@ -1491,6 +1511,8 @@ func runSessionHTTPPoll(ctx context.Context, httpURL string) error {
 	if err := bootstrapRegistry(ctx, ec, reg); err != nil {
 		return err
 	}
+	go autoDiscoverBackground(ctx, ec, reg, nil)
+
 	log.Printf("BASE_FORCE_HTTP_POLL: HTTP опрос getReserves (аналитика, не для боя)")
 	callOpts := &bind.CallOpts{Context: ctx}
 	tick := time.NewTicker(750 * time.Millisecond)
@@ -1665,14 +1687,15 @@ func loadAutoDiscoverSettings() {
 	case "0":
 		autoMinWethPerPool = nil
 	case "":
-		autoMinWethPerPool = big.NewInt(100_000_000_000_000_000) // 0.1 WETH на каждый пул
+		// 0.02 WETH — больше пар проходит фильтр, чем при 0.1; для «жёсткого» отбора задайте в .env
+		autoMinWethPerPool = big.NewInt(20_000_000_000_000_000)
 	default:
 		bi := new(big.Int)
 		if _, ok := bi.SetString(mw, 10); ok && bi.Sign() > 0 {
 			autoMinWethPerPool = bi
 		} else {
-			autoMinWethPerPool = big.NewInt(100_000_000_000_000_000)
-			log.Printf("AUTO_MIN_WETH_WEI: не разобран %q, остаётся 0.1 WETH", mw)
+			autoMinWethPerPool = big.NewInt(20_000_000_000_000_000)
+			log.Printf("AUTO_MIN_WETH_WEI: не разобран %q, остаётся 0.02 WETH", mw)
 		}
 	}
 	minLabel := "выкл"
