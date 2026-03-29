@@ -93,10 +93,13 @@ var (
 	// Авто-поиск WETH-пар по логам Uni V2 (см. loadAutoDiscoverSettings в main).
 	autoDiscoverEnabled  = true
 	autoPairTarget       = 100
-	autoLogBlockSpan     uint64 = 500_000
-	autoLogChunk         uint64 = 2_000
-	autoMaxUniqueQuotes  = 500
-	autoMinWethPerPool   *big.Int // nil = не фильтровать по мин. WETH
+	autoLogBlockSpan        uint64        = 500_000
+	autoLogChunk            uint64        = 800 // меньше чанк — меньше CU за запрос (Alchemy)
+	autoLogThrottle         time.Duration = 450 * time.Millisecond // пауза между успешными чанками
+	autoLogRetryInitial     time.Duration = 2 * time.Second        // первая пауза при CU/s limit
+	autoScoreThrottle       time.Duration = 35 * time.Millisecond // между оценками ликвидности (getReserves)
+	autoMaxUniqueQuotes     = 500
+	autoMinWethPerPool      *big.Int // nil = не фильтровать по мин. WETH
 
 	// Динамический газ: SuggestGasPrice × лимит (2 свопа), кэш ~12s; клиент выставляет сессия.
 	gasOracleMu           sync.Mutex
@@ -470,6 +473,115 @@ func minWETHReserveBothPools(ctx context.Context, ec *ethclient.Client, quote co
 	return new(big.Int).Set(sw), true, nil
 }
 
+func isRPCThroughputErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	m := strings.ToLower(err.Error())
+	return strings.Contains(m, "compute units") ||
+		strings.Contains(m, "throughput") ||
+		strings.Contains(m, "capacity") && strings.Contains(m, "exceeded") ||
+		strings.Contains(m, "429") ||
+		strings.Contains(m, "too many requests") ||
+		strings.Contains(m, "rate limit")
+}
+
+func filterLogsUniPairCreated(ctx context.Context, ec *ethclient.Client, lo, hi uint64) ([]types.Log, error) {
+	return ec.FilterLogs(ctx, ethereum.FilterQuery{
+		FromBlock: new(big.Int).SetUint64(lo),
+		ToBlock:   new(big.Int).SetUint64(hi),
+		Addresses: []common.Address{addrUniswapV2Factory},
+		Topics:    [][]common.Hash{{pairCreatedTopic}},
+	})
+}
+
+// fetchUniPairCreatedChunk: повторы с бэкоффом при лимите CU/s; без спама в лог на каждую попытку.
+func fetchUniPairCreatedChunk(ctx context.Context, ec *ethclient.Client, lo, hi uint64) ([]types.Log, error) {
+	const maxAttempts = 14
+	backoff := autoLogRetryInitial
+	var lastErr error
+	loggedThrottle := false
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		default:
+		}
+		logs, err := filterLogsUniPairCreated(ctx, ec, lo, hi)
+		if err == nil {
+			return logs, nil
+		}
+		lastErr = err
+		if !isRPCThroughputErr(err) {
+			return nil, err
+		}
+		if !loggedThrottle {
+			log.Printf("AUTO_DISCOVER: лимит CU/s у RPC — паузы и повторы (чанк %d-%d); при необходимости уменьшите AUTO_LOG_CHUNK", lo, hi)
+			loggedThrottle = true
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+		backoff = time.Duration(float64(backoff) * 1.45)
+		if backoff > 28*time.Second {
+			backoff = 28 * time.Second
+		}
+	}
+	return nil, lastErr
+}
+
+// fetchUniPairCreatedLogs: один чанк или рекурсивное деление при упорном throughput-ошибке.
+func fetchUniPairCreatedLogs(ctx context.Context, ec *ethclient.Client, lo, hi uint64) ([]types.Log, error) {
+	if lo > hi {
+		return nil, nil
+	}
+	logs, err := fetchUniPairCreatedChunk(ctx, ec, lo, hi)
+	if err == nil {
+		return logs, nil
+	}
+	if !isRPCThroughputErr(err) || lo >= hi {
+		return nil, err
+	}
+	// Слишком узкий диапазон — не делим бесконечно
+	if hi-lo+1 <= 80 {
+		return nil, err
+	}
+	mid := lo + (hi-lo)/2
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(autoLogThrottle):
+	}
+	a, e1 := fetchUniPairCreatedLogs(ctx, ec, lo, mid)
+	if e1 != nil {
+		return nil, e1
+	}
+	select {
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	case <-time.After(autoLogThrottle):
+	}
+	b, e2 := fetchUniPairCreatedLogs(ctx, ec, mid+1, hi)
+	if e2 != nil {
+		return nil, e2
+	}
+	return append(a, b...), nil
+}
+
+func sleepDiscoverThrottle(ctx context.Context) error {
+	if autoLogThrottle <= 0 {
+		return nil
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(autoLogThrottle):
+		return nil
+	}
+}
+
 // discoverUniWETHQuoteAddresses — уникальные quote из PairCreated на Uniswap V2 (от новых блоков к старым).
 func discoverUniWETHQuoteAddresses(ctx context.Context, ec *ethclient.Client, reg *registry) ([]common.Address, error) {
 	latest, err := ec.BlockNumber(ctx)
@@ -488,16 +600,14 @@ func discoverUniWETHQuoteAddresses(ctx context.Context, ec *ethclient.Client, re
 		if lo < fromBlk {
 			lo = fromBlk
 		}
-		logs, err := ec.FilterLogs(ctx, ethereum.FilterQuery{
-			FromBlock: new(big.Int).SetUint64(lo),
-			ToBlock:   new(big.Int).SetUint64(hi),
-			Addresses: []common.Address{addrUniswapV2Factory},
-			Topics:    [][]common.Hash{{pairCreatedTopic}},
-		})
+		logs, err := fetchUniPairCreatedLogs(ctx, ec, lo, hi)
 		if err != nil {
-			log.Printf("AUTO_DISCOVER: FilterLogs %d-%d: %v", lo, hi, err)
+			log.Printf("AUTO_DISCOVER: FilterLogs %d-%d окончательно: %v", lo, hi, err)
 			if lo >= hi {
 				break
+			}
+			if err := sleepDiscoverThrottle(ctx); err != nil {
+				return quotes, err
 			}
 			hi = lo - 1
 			continue
@@ -530,6 +640,9 @@ func discoverUniWETHQuoteAddresses(ctx context.Context, ec *ethclient.Client, re
 			break
 		}
 		hi = lo - 1
+		if err := sleepDiscoverThrottle(ctx); err != nil {
+			return quotes, err
+		}
 	}
 	return quotes, nil
 }
@@ -553,7 +666,16 @@ func autoDiscoverFillRegistry(ctx context.Context, ec *ethclient.Client, reg *re
 		score *big.Int
 	}
 	var rows []scored
-	for _, q := range quotes {
+scoring:
+	for i, q := range quotes {
+		if i > 0 && autoScoreThrottle > 0 {
+			select {
+			case <-ctx.Done():
+				log.Printf("AUTO_DISCOVER: оценка ликвидности прервана: %v", ctx.Err())
+				break scoring
+			case <-time.After(autoScoreThrottle):
+			}
+		}
 		if reg.hasWETHQuote(q) {
 			continue
 		}
@@ -1463,6 +1585,21 @@ func loadAutoDiscoverSettings() {
 			autoLogChunk = n
 		}
 	}
+	if v := strings.TrimSpace(os.Getenv("AUTO_LOG_THROTTLE_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			autoLogThrottle = time.Duration(n) * time.Millisecond
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("AUTO_LOG_RETRY_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			autoLogRetryInitial = time.Duration(n) * time.Millisecond
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("AUTO_SCORE_THROTTLE_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			autoScoreThrottle = time.Duration(n) * time.Millisecond
+		}
+	}
 	if v := strings.TrimSpace(os.Getenv("AUTO_MAX_CANDIDATES")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			autoMaxUniqueQuotes = n
@@ -1487,8 +1624,8 @@ func loadAutoDiscoverSettings() {
 	if autoMinWethPerPool != nil {
 		minLabel = new(big.Rat).SetFrac(autoMinWethPerPool, tenPowU8(18)).FloatString(4) + " WETH/пул"
 	}
-	log.Printf("AUTO_DISCOVER: цель %d пар | глубина логов ~%d блоков | чанк %d | кандидатов ≤%d | min ликв. %s",
-		autoPairTarget, autoLogBlockSpan, autoLogChunk, autoMaxUniqueQuotes, minLabel)
+	log.Printf("AUTO_DISCOVER: цель %d пар | логи ~%d блоков | чанк %d | пауза между чанками %v | retry CU/s с %v | score-throttle %v | кандидатов ≤%d | min ликв. %s",
+		autoPairTarget, autoLogBlockSpan, autoLogChunk, autoLogThrottle, autoLogRetryInitial, autoScoreThrottle, autoMaxUniqueQuotes, minLabel)
 }
 
 func loadNotionalAndEthHint() {
