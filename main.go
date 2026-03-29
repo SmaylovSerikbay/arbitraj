@@ -253,6 +253,18 @@ func decimalsOf(a common.Address) uint8 {
 	return 18
 }
 
+func logSkippedPairsEnabled() bool {
+	return strings.TrimSpace(os.Getenv("LOG_SKIPPED_PAIRS")) == "1"
+}
+
+func formatWeiEthShort(w *big.Int) string {
+	if w == nil {
+		return "0"
+	}
+	r := new(big.Rat).SetFrac(w, tenPowU8(18))
+	return r.FloatString(4) + " WETH"
+}
+
 type quoteToken struct {
 	addr   common.Address
 	symbol string
@@ -1125,6 +1137,16 @@ func (r *registry) tryRegisterWETHPair(ctx context.Context, ec *ethclient.Client
 		return false, err
 	}
 	if uniP == (common.Address{}) || sushiP == (common.Address{}) {
+		if logSkippedPairsEnabled() {
+			switch {
+			case uniP == (common.Address{}) && sushiP == (common.Address{}):
+				log.Printf("пропуск %s: нет пула WETH на Uniswap V2 и на SushiSwap V2", label)
+			case uniP == (common.Address{}):
+				log.Printf("пропуск %s: нет пула WETH на Uniswap V2", label)
+			default:
+				log.Printf("пропуск %s: нет пула WETH на SushiSwap V2", label)
+			}
+		}
 		r.mu.Unlock()
 		return false, nil
 	}
@@ -1179,6 +1201,10 @@ func (r *registry) tryRegisterWETHPair(ctx context.Context, ec *ethclient.Client
 		uw := wethSideReserve(tp.uniR0, tp.uniR1, wIsT0)
 		sw := wethSideReserve(tp.sushiR0, tp.sushiR1, wIsT0)
 		if uw.Cmp(minWethPerPool) < 0 || sw.Cmp(minWethPerPool) < 0 {
+			if logSkippedPairsEnabled() {
+				log.Printf("пропуск %s: резерв WETH Uni=%s Sushi=%s (нужно ≥ %s по AUTO_MIN_WETH_WEI)",
+					label, formatWeiEthShort(uw), formatWeiEthShort(sw), formatWeiEthShort(minWethPerPool))
+			}
 			r.mu.Unlock()
 			return false, nil
 		}
@@ -1239,7 +1265,8 @@ func bootstrapRegistry(ctx context.Context, ec *ethclient.Client, reg *registry)
 		}
 		return errors.New("ни одна WETH-пара не найдена на обоих DEX (getPair пустой)")
 	}
-	log.Printf("старт (ручной список): %d пар | пулов Sync: %d | AUTO_DISCOVER пойдёт в фоне", reg.pairCount(), reg.poolAddressCount())
+	log.Printf("bootstrap: вручную %d/%d пар | пулов Sync: %d | AUTO_DISCOVER в фоне (пропуски: нет Uni+Sushi V2 или WETH < AUTO_MIN_WETH_WEI; детали: LOG_SKIPPED_PAIRS=1)",
+		registered, len(list), reg.poolAddressCount())
 	return nil
 }
 
