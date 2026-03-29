@@ -81,6 +81,7 @@ var (
 	pairParsedABI    abi.ABI
 	syncTopic        common.Hash
 	pairCreatedTopic common.Hash
+	v3SwapTopic      common.Hash
 
 	pow10tab [37]*big.Int
 
@@ -133,6 +134,9 @@ func init() {
 	}
 	syncTopic = crypto.Keccak256Hash([]byte("Sync(uint112,uint112)"))
 	pairCreatedTopic = crypto.Keccak256Hash([]byte("PairCreated(address,address,address,uint256)"))
+	// Uniswap V3 Swap event signature:
+	// Swap(address indexed sender,address indexed recipient,int256 amount0,int256 amount1,uint160 sqrtPriceX96,uint128 liquidity,int24 tick)
+	v3SwapTopic = crypto.Keccak256Hash([]byte("Swap(address,address,int256,int256,uint160,uint128,int24)"))
 	for i := range pow10tab {
 		pow10tab[i] = new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(i)), nil)
 	}
@@ -144,6 +148,7 @@ func init() {
 var (
 	syncEventsParsed        uint64
 	pairCreatedLogsReceived uint64
+	v3SwapLogsReceived      uint64
 )
 
 // Накопительная статистика за время работы процесса (переживает переподключения RPC).
@@ -188,7 +193,7 @@ func formatWithCommas(n uint64) string {
 }
 
 func printStatsSummaryBlock() {
-	totalEv := atomic.LoadUint64(&syncEventsParsed) + atomic.LoadUint64(&pairCreatedLogsReceived)
+	totalEv := atomic.LoadUint64(&syncEventsParsed) + atomic.LoadUint64(&pairCreatedLogsReceived) + atomic.LoadUint64(&v3SwapLogsReceived)
 	appStats.mu.Lock()
 	opps := appStats.opportunities
 	total := appStats.totalPotential
@@ -418,12 +423,14 @@ type registry struct {
 	mu    sync.RWMutex
 	byKey map[string]*trackedPair
 	refs  map[common.Address]*addrRef
+	v3   map[common.Address]*trackedPair // Uniswap V3 pool addr -> tracked pair (для Swap-триггера)
 }
 
 func newRegistry() *registry {
 	return &registry{
 		byKey: make(map[string]*trackedPair),
 		refs:  make(map[common.Address]*addrRef),
+		v3:    make(map[common.Address]*trackedPair),
 	}
 }
 
@@ -439,6 +446,12 @@ func (r *registry) poolAddressCount() int {
 	return len(r.refs)
 }
 
+func (r *registry) v3PoolCount() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return len(r.v3)
+}
+
 func (r *registry) snapshotAddresses() []common.Address {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -449,10 +462,26 @@ func (r *registry) snapshotAddresses() []common.Address {
 	return out
 }
 
+func (r *registry) snapshotV3Pools() []common.Address {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]common.Address, 0, len(r.v3))
+	for a := range r.v3 {
+		out = append(out, a)
+	}
+	return out
+}
+
 func (r *registry) getRef(addr common.Address) *addrRef {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.refs[addr]
+}
+
+func (r *registry) getV3TP(addr common.Address) *trackedPair {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.v3[addr]
 }
 
 func (r *registry) hasWETHQuote(quote common.Address) bool {
@@ -1101,6 +1130,9 @@ var printMu sync.Mutex
 var lastPrintKey string
 var lastPrintAt time.Time
 
+// fee tiers to probe on Uniswap V3 (common on Base).
+var v3FeeTiers = []uint32{3000, 500, 10000, 100}
+
 func shouldPrint(netPct float64, buy, sell, pairLabel string, spam bool) bool {
 	key := fmt.Sprintf("%.4f|%s|%s|%s", netPct, buy, sell, pairLabel)
 	now := time.Now()
@@ -1232,6 +1264,24 @@ func (r *registry) tryRegisterWETHPair(ctx context.Context, ec *ethclient.Client
 	r.refs[uniP] = &addrRef{tp, true}
 	r.refs[sushiP] = &addrRef{tp, false}
 	r.mu.Unlock()
+
+	// Привязываем V3 пулы (Swap-триггер), чтобы реагировать на движение цены в V3, даже если V2 молчит.
+	if enableV3Arb && ec != nil {
+		for _, fee := range v3FeeTiers {
+			p, err := getV3Pool(ctx, ec, addrWETH, quote, fee)
+			if err != nil {
+				continue
+			}
+			if p == (common.Address{}) {
+				continue
+			}
+			r.mu.Lock()
+			if r.v3[p] == nil {
+				r.v3[p] = tp
+			}
+			r.mu.Unlock()
+		}
+	}
 
 	tp.evaluateAndMaybePrint()
 	log.Printf("зарегистрирована пара %s | Uni %s | Sushi %s", label, uniP.Hex(), sushiP.Hex())
@@ -1474,6 +1524,74 @@ func runSyncLoop(ctx context.Context, ec *ethclient.Client, reg *registry, bump 
 	}
 }
 
+func listenV3SwapBatch(ctx context.Context, ec *ethclient.Client, reg *registry, addrs []common.Address) error {
+	if len(addrs) == 0 {
+		return errors.New("нет адресов для V3 Swap")
+	}
+	ch := make(chan types.Log, 2048)
+	q := ethereum.FilterQuery{
+		Addresses: addrs,
+		Topics:    [][]common.Hash{{v3SwapTopic}},
+	}
+	sub, err := ec.SubscribeFilterLogs(ctx, q, ch)
+	if err != nil {
+		return err
+	}
+	defer sub.Unsubscribe()
+	log.Printf("Subscribed to V3 Swap: %d pool address(es)", len(addrs))
+
+	for {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case err := <-sub.Err():
+			return err
+		case lg := <-ch:
+			atomic.AddUint64(&v3SwapLogsReceived, 1)
+			tp := reg.getV3TP(lg.Address)
+			if tp == nil {
+				continue
+			}
+			tp.evaluateAndMaybePrint()
+		}
+	}
+}
+
+func runV3SwapLoop(ctx context.Context, ec *ethclient.Client, reg *registry, bump <-chan struct{}) error {
+	for {
+		addrs := reg.snapshotV3Pools()
+		if len(addrs) == 0 {
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(time.Second):
+				continue
+			case <-bump:
+				continue
+			}
+		}
+		innerCtx, cancel := context.WithCancel(ctx)
+		errCh := make(chan error, 1)
+		go func() { errCh <- listenV3SwapBatch(innerCtx, ec, reg, addrs) }()
+		select {
+		case <-ctx.Done():
+			cancel()
+			<-errCh
+			return ctx.Err()
+		case <-bump:
+			cancel()
+			<-errCh
+			continue
+		case err := <-errCh:
+			cancel()
+			if err != nil && !errors.Is(err, context.Canceled) {
+				return err
+			}
+			continue
+		}
+	}
+}
+
 func heartbeatMinuteLoop(ctx context.Context, reg *registry) {
 	t := time.NewTicker(heartbeatInterval)
 	defer t.Stop()
@@ -1482,7 +1600,7 @@ func heartbeatMinuteLoop(ctx context.Context, reg *registry) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			parsed := atomic.LoadUint64(&syncEventsParsed) + atomic.LoadUint64(&pairCreatedLogsReceived)
+			parsed := atomic.LoadUint64(&syncEventsParsed) + atomic.LoadUint64(&pairCreatedLogsReceived) + atomic.LoadUint64(&v3SwapLogsReceived)
 			tm := time.Now().Format("15:04")
 			log.Printf("[INFO] %s | Parsed %d events | Active pairs: %d | Status: Connected.",
 				tm, parsed, reg.pairCount())
@@ -1539,6 +1657,12 @@ func runSessionWebSocket(ctx context.Context, wssURL, httpURL string, splitHTTP 
 	go func() { errPC <- listenPairCreated(innerCtx, wsCli, reg, bump) }()
 	errSY := make(chan error, 1)
 	go func() { errSY <- runSyncLoop(innerCtx, wsCli, reg, bump) }()
+	errV3 := make(chan error, 1)
+	if enableV3Arb {
+		go func() { errV3 <- runV3SwapLoop(innerCtx, wsCli, reg, bump) }()
+	} else {
+		close(errV3)
+	}
 	go heartbeatMinuteLoop(innerCtx, reg)
 	go statsSummaryLoop(innerCtx)
 
@@ -1547,14 +1671,28 @@ func runSessionWebSocket(ctx context.Context, wssURL, httpURL string, splitHTTP 
 		cancel()
 		<-errPC
 		<-errSY
+		if enableV3Arb {
+			<-errV3
+		}
 		return ctx.Err()
 	case err := <-errPC:
 		cancel()
 		<-errSY
+		if enableV3Arb {
+			<-errV3
+		}
 		return err
 	case err := <-errSY:
 		cancel()
 		<-errPC
+		if enableV3Arb {
+			<-errV3
+		}
+		return err
+	case err := <-errV3:
+		cancel()
+		<-errPC
+		<-errSY
 		return err
 	}
 }
