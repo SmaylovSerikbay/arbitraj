@@ -513,6 +513,25 @@ func (r *registry) getV3Only(addr common.Address) *v3Quote {
 	return r.v3Only[addr]
 }
 
+// v3OnlyDistinctQuotes — сколько уникальных WETH/quote токенов отслеживается только через V3 (без полной пары UniV2+SushiV2).
+func (r *registry) v3OnlyDistinctQuotes() int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	seen := make(map[string]struct{})
+	for _, vq := range r.v3Only {
+		if vq == nil {
+			continue
+		}
+		t0, t1 := sortTokens(addrWETH, vq.quote)
+		key := pairKeyString(t0, t1)
+		if _, full := r.byKey[key]; full {
+			continue
+		}
+		seen[key] = struct{}{}
+	}
+	return len(seen)
+}
+
 func (r *registry) hasWETHQuote(quote common.Address) bool {
 	t0, t1 := sortTokens(addrWETH, quote)
 	key := pairKeyString(t0, t1)
@@ -1698,8 +1717,9 @@ func heartbeatMinuteLoop(ctx context.Context, reg *registry) {
 		case <-t.C:
 			parsed := atomic.LoadUint64(&syncEventsParsed) + atomic.LoadUint64(&pairCreatedLogsReceived) + atomic.LoadUint64(&v3SwapLogsReceived)
 			tm := time.Now().Format("15:04")
-			log.Printf("[INFO] %s | Parsed %d events | Active pairs: %d | Status: Connected.",
-				tm, parsed, reg.pairCount())
+			// «Active pairs» раньше = только UniV2+SushiV2; V3-only токены считаются отдельно.
+			log.Printf("[INFO] %s | Parsed %d events | V2↔V2 pairs: %d | V3-only tokens: %d | V3 pool addrs: %d | Status: Connected.",
+				tm, parsed, reg.pairCount(), reg.v3OnlyDistinctQuotes(), reg.v3PoolCount())
 		}
 	}
 }
