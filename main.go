@@ -86,7 +86,11 @@ var (
 	pow10tab [37]*big.Int
 
 	minNetProfitThreshold        *big.Rat
+	minNetProfitBase             *big.Rat // базовый порог из MIN_NET_PROFIT_PCT (без надбавки при дорогом газе)
 	statsOpportunityThreshold    *big.Rat // net-% ≥ этого попадает в счётчик «оппортьюнити» (по умолчанию 0.5%)
+	// Если dynamicGasUSD() > gasUsdHighExtraMinNet — к порогу добавляется minNetExtraPctWhenGasHigh (%).
+	gasUsdHighExtraMinNet     *big.Rat
+	minNetExtraPctWhenGasHigh *big.Rat
 	spamPrintMode                bool     // MIN_NET_PROFIT_PCT ≤ 0
 	ratSwapFeesPct = big.NewRat(6, 10)
 	ratGasUSD      = big.NewRat(5, 100) // фоллбэк, если RPC недоступен
@@ -141,7 +145,10 @@ func init() {
 		pow10tab[i] = new(big.Int).Exp(big.NewInt(10), big.NewInt(int64(i)), nil)
 	}
 	minNetProfitThreshold = big.NewRat(5, 10)
+	minNetProfitBase = new(big.Rat).Set(minNetProfitThreshold)
 	statsOpportunityThreshold = big.NewRat(5, 10)
+	gasUsdHighExtraMinNet = big.NewRat(35, 100)     // $0.35 — выше этого газа поднимаем планку
+	minNetExtraPctWhenGasHigh = big.NewRat(2, 10) // +0.2% к MIN_NET_PROFIT_PCT
 }
 
 // Счётчики событий WebSocket (atomic).
@@ -970,6 +977,22 @@ func dynamicGasUSD() *big.Rat {
 	return new(big.Rat).Set(usd)
 }
 
+// effectiveMinNetProfitPct — базовый MIN_NET_PROFIT_PCT; при дорогом газе добавляет надбавку (см. GAS_USD_HIGH_FOR_EXTRA_MIN_NET).
+func effectiveMinNetProfitPct() *big.Rat {
+	base := minNetProfitBase
+	if base == nil {
+		base = minNetProfitThreshold
+	}
+	out := new(big.Rat).Set(base)
+	if gasUsdHighExtraMinNet != nil && minNetExtraPctWhenGasHigh != nil {
+		g := dynamicGasUSD()
+		if g.Cmp(gasUsdHighExtraMinNet) > 0 {
+			out.Add(out, minNetExtraPctWhenGasHigh)
+		}
+	}
+	return out
+}
+
 func shouldPrintLowLiquidity(pairLabel string) bool {
 	lowLiqPrintMu.Lock()
 	defer lowLiqPrintMu.Unlock()
@@ -1186,7 +1209,7 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 		if simPotNet.Sign() <= 0 {
 			return
 		}
-		if simNetPct.Cmp(minNetProfitThreshold) <= 0 {
+		if simNetPct.Cmp(effectiveMinNetProfitPct()) <= 0 {
 			return
 		}
 	}
@@ -1254,7 +1277,7 @@ func evaluateV3OnlyOpportunity(parentCtx context.Context, ec *ethclient.Client, 
 		q.Quo(pot, ratNotional)
 		netPct.Mul(&q, rat100)
 	}
-	if netPct.Cmp(minNetProfitThreshold) <= 0 {
+	if netPct.Cmp(effectiveMinNetProfitPct()) <= 0 {
 		return
 	}
 	netF, _ := netPct.Float64()
@@ -1960,10 +1983,28 @@ func loadMinNetProfitPct() {
 	r := new(big.Rat)
 	if _, ok := r.SetString(s); ok {
 		minNetProfitThreshold = r
+		minNetProfitBase = new(big.Rat).Set(r)
 		log.Printf("MIN_NET_PROFIT_PCT=%s (порог печати PROFIT FOUND; ≤0 = тестовый спам микроспредов)", r.FloatString(4))
 		return
 	}
 	log.Printf("MIN_NET_PROFIT_PCT: не разобран %q, остаётся 0.5", s)
+}
+
+func loadGasAdaptiveMinNetProfit() {
+	if v := strings.TrimSpace(os.Getenv("GAS_USD_HIGH_FOR_EXTRA_MIN_NET")); v != "" {
+		r := new(big.Rat)
+		if _, ok := r.SetString(v); ok && r.Sign() > 0 {
+			gasUsdHighExtraMinNet = r
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("MIN_NET_EXTRA_PCT_WHEN_GAS_HIGH")); v != "" {
+		r := new(big.Rat)
+		if _, ok := r.SetString(v); ok && r.Sign() >= 0 {
+			minNetExtraPctWhenGasHigh = r
+		}
+	}
+	log.Printf("газ→порог: если gas~>$%s, к MIN_NET_PROFIT_PCT добавляется +%s%%",
+		gasUsdHighExtraMinNet.FloatString(2), minNetExtraPctWhenGasHigh.FloatString(2))
 }
 
 func loadStatsOpportunityThreshold() {
@@ -2093,6 +2134,7 @@ func main() {
 	loadV3ArbSettings()
 	loadAeroSettings()
 	loadMinNetProfitPct()
+	loadGasAdaptiveMinNetProfit()
 	loadStatsOpportunityThreshold()
 	spamPrintMode = minNetProfitThreshold.Sign() <= 0
 	if spamPrintMode {
