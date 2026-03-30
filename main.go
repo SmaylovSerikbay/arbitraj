@@ -1361,7 +1361,11 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 	if realTradingEnabled {
 		if ec := ethClientForV3(); ec != nil { // это call-client (dRPC), выставлен через setGasOracleClient
 			ctxX, cancelX := context.WithTimeout(context.Background(), 25*time.Second)
-			executeRealV2V2RoundTrip(ctxX, ec, tp.label, buyName, sellName, quoteTok, wethIn, simPotF)
+			if strings.Contains(buyName, "UniV3") || strings.Contains(sellName, "UniV3") {
+				executeRealHybridV3V2RoundTrip(ctxX, ec, tp.label, buyName, sellName, quoteTok, wethIn, simPotF)
+			} else {
+				executeRealV2V2RoundTrip(ctxX, ec, tp.label, buyName, sellName, quoteTok, wethIn, simPotF)
+			}
 			cancelX()
 		}
 	}

@@ -26,6 +26,7 @@ import (
 var (
 	addrUniswapV2Router = common.HexToAddress("0x4752ba5dbc23f44d87826276bf6fd6b1c372ad24")
 	addrSushiV2Router   = common.HexToAddress("0x6BDED42c6DA8FBf0d2bA55B2fa120C5e0c8D7891")
+	addrUniswapV3Router = common.HexToAddress("0x2626664c2603336E57B271c5C0b26F421741e481") // SwapRouter02
 )
 
 var (
@@ -43,6 +44,13 @@ var (
 const erc20ABIJSON = `[{"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":true,"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":false,"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"}]`
 
 const uniV2RouterABIJSON = `[
+  {"name":"getAmountsOut","type":"function","stateMutability":"view",
+   "inputs":[
+     {"name":"amountIn","type":"uint256"},
+     {"name":"path","type":"address[]"}
+   ],
+   "outputs":[{"name":"amounts","type":"uint256[]"}]
+  },
   {"name":"swapExactTokensForTokens","type":"function","stateMutability":"nonpayable",
    "inputs":[
      {"name":"amountIn","type":"uint256"},
@@ -55,9 +63,26 @@ const uniV2RouterABIJSON = `[
   }
 ]`
 
+const uniV3RouterABIJSON = `[
+  {"name":"exactInputSingle","type":"function","stateMutability":"payable",
+   "inputs":[{"name":"params","type":"tuple","components":[
+     {"name":"tokenIn","type":"address"},
+     {"name":"tokenOut","type":"address"},
+     {"name":"fee","type":"uint24"},
+     {"name":"recipient","type":"address"},
+     {"name":"deadline","type":"uint256"},
+     {"name":"amountIn","type":"uint256"},
+     {"name":"amountOutMinimum","type":"uint256"},
+     {"name":"sqrtPriceLimitX96","type":"uint160"}
+   ]}],
+   "outputs":[{"name":"amountOut","type":"uint256"}]
+  }
+]`
+
 var (
 	erc20Parsed     abi.ABI
 	uniV2RouterABIv abi.ABI
+	uniV3RouterABIv abi.ABI
 )
 
 func init() {
@@ -67,6 +92,10 @@ func init() {
 		panic(err)
 	}
 	uniV2RouterABIv, err = abi.JSON(strings.NewReader(uniV2RouterABIJSON))
+	if err != nil {
+		panic(err)
+	}
+	uniV3RouterABIv, err = abi.JSON(strings.NewReader(uniV3RouterABIJSON))
 	if err != nil {
 		panic(err)
 	}
@@ -308,6 +337,73 @@ func pctToMinOut(expected *big.Int, slippagePct float64) *big.Int {
 	return big.NewInt(int64(f))
 }
 
+func routerGetAmountsOut(ctx context.Context, ec *ethclient.Client, router common.Address, amountIn *big.Int, path []common.Address) (*big.Int, error) {
+	if amountIn == nil || amountIn.Sign() <= 0 || len(path) < 2 {
+		return nil, errors.New("bad getAmountsOut args")
+	}
+	data, err := uniV2RouterABIv.Pack("getAmountsOut", amountIn, path)
+	if err != nil {
+		return nil, err
+	}
+	msg := ethereum.CallMsg{To: &router, Data: data}
+	out, err := callContractRetry(ctx, ec, msg, nil)
+	if err != nil {
+		return nil, err
+	}
+	vals, err := uniV2RouterABIv.Unpack("getAmountsOut", out)
+	if err != nil || len(vals) < 1 {
+		return nil, err
+	}
+	arr, ok := vals[0].([]*big.Int)
+	if !ok || len(arr) < 2 || arr[len(arr)-1] == nil {
+		return nil, errors.New("getAmountsOut: bad decode")
+	}
+	return new(big.Int).Set(arr[len(arr)-1]), nil
+}
+
+func parseV3FeeFromTag(tag string) (uint32, bool) {
+	// tag like: UniV3(0.3%)
+	if !strings.Contains(tag, "UniV3(") {
+		return 0, false
+	}
+	switch {
+	case strings.Contains(tag, "0.01%"):
+		return 100, true
+	case strings.Contains(tag, "0.05%"):
+		return 500, true
+	case strings.Contains(tag, "0.3%"):
+		return 3000, true
+	case strings.Contains(tag, "1%"):
+		return 10000, true
+	default:
+		return 0, false
+	}
+}
+
+func v3ExactInputSingleTxData(tokenIn, tokenOut common.Address, fee uint32, recipient common.Address, amountIn, amountOutMin *big.Int, deadline *big.Int) ([]byte, error) {
+	type params struct {
+		TokenIn           common.Address `abi:"tokenIn"`
+		TokenOut          common.Address `abi:"tokenOut"`
+		Fee               *big.Int       `abi:"fee"`
+		Recipient         common.Address `abi:"recipient"`
+		Deadline          *big.Int       `abi:"deadline"`
+		AmountIn          *big.Int       `abi:"amountIn"`
+		AmountOutMinimum  *big.Int       `abi:"amountOutMinimum"`
+		SqrtPriceLimitX96 *big.Int       `abi:"sqrtPriceLimitX96"`
+	}
+	p := params{
+		TokenIn:           tokenIn,
+		TokenOut:          tokenOut,
+		Fee:               big.NewInt(int64(fee)),
+		Recipient:         recipient,
+		Deadline:          deadline,
+		AmountIn:          amountIn,
+		AmountOutMinimum:  amountOutMin,
+		SqrtPriceLimitX96: big.NewInt(0),
+	}
+	return uniV3RouterABIv.Pack("exactInputSingle", p)
+}
+
 func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLabel string, buyName, sellName string, quote common.Address, wethIn *big.Int, estProfitUSD float64) {
 	if !realTradingEnabled {
 		return
@@ -415,5 +511,168 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 
 	appendRealTradeLog(fmt.Sprintf("%s | %s | %s | estProfit=$%.2f | tx1=%s | tx2=%s",
 		time.Now().Format(time.RFC3339), pairLabel, status, estProfitUSD, tx1.Hash().Hex(), tx2.Hash().Hex()))
+}
+
+// executeRealHybridV3V2RoundTrip — исполняет реальный 2-лег маршрут, где одна нога UniV3 exactInputSingle, вторая — V2 router.
+// Поддерживаем только токены WETH<->quote и только один V2 DEX (UniV2 или Sushi) как во внутреннем выборе hyBuy/hySell.
+func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLabel string, buyName, sellName string, quote common.Address, wethIn *big.Int, estProfitUSD float64) {
+	if !realTradingEnabled {
+		return
+	}
+	pk, trader, err := parseTraderKey()
+	if err != nil {
+		log.Printf("[REAL] key: %v", err)
+		return
+	}
+	hardStopIfLossExceeded(ctx, ec, trader)
+
+	fee, ok := parseV3FeeFromTag(buyName)
+	v3First := true
+	if !ok {
+		fee, ok = parseV3FeeFromTag(sellName)
+		v3First = false
+	}
+	if !ok {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP bad_v3_tag=%s→%s", time.Now().Format(time.RFC3339), pairLabel, buyName, sellName))
+		return
+	}
+
+	// Identify V2 router name and address
+	v2Name := buyName
+	if strings.Contains(v2Name, "UniV3") {
+		v2Name = sellName
+	}
+	var v2Router common.Address
+	switch v2Name {
+	case "UniswapV2", "SushiSwapV2", "SushiSwap":
+		// normalize legacy labels
+		if v2Name == "UniswapV2" {
+			v2Router = addrUniswapV2Router
+		} else {
+			v2Router = addrSushiV2Router
+		}
+	default:
+		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP unsupported_v2=%s", time.Now().Format(time.RFC3339), pairLabel, v2Name))
+		return
+	}
+
+	deadline := big.NewInt(time.Now().Add(60 * time.Second).Unix())
+
+	// leg1 expected out
+	var leg1OutExp *big.Int
+	if v3First {
+		leg1OutExp, err = quoteV3ExactInputSingle(ctx, ec, addrWETH, quote, fee, wethIn)
+	} else {
+		leg1OutExp, err = routerGetAmountsOut(ctx, ec, v2Router, wethIn, []common.Address{addrWETH, quote})
+	}
+	if err != nil || leg1OutExp == nil || leg1OutExp.Sign() <= 0 {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | ABORT leg1_quote_fail | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
+		return
+	}
+	leg1Min := pctToMinOut(leg1OutExp, realMaxSlippagePct)
+
+	// approvals for leg1
+	if _, err := ensureApprove(ctx, ec, pk, trader, addrWETH, func() common.Address {
+		if v3First {
+			return addrUniswapV3Router
+		}
+		return v2Router
+	}(), wethIn); err != nil {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | APPROVE_FAIL leg1 | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
+		return
+	}
+
+	// execute leg1
+	var tx1 *types.Transaction
+	if v3First {
+		data, err := v3ExactInputSingleTxData(addrWETH, quote, fee, trader, wethIn, leg1Min, deadline)
+		if err != nil {
+			return
+		}
+		tx1, err = sendDynamicTx(ctx, ec, pk, trader, &addrUniswapV3Router, data, big.NewInt(0))
+		if err != nil {
+			appendRealTradeLog(fmt.Sprintf("%s | %s | TX1_SUBMIT_FAIL UniV3 | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
+			return
+		}
+	} else {
+		data, err := uniV2RouterABIv.Pack("swapExactTokensForTokens", wethIn, leg1Min, []common.Address{addrWETH, quote}, trader, deadline)
+		if err != nil {
+			return
+		}
+		tx1, err = sendDynamicTx(ctx, ec, pk, trader, &v2Router, data, big.NewInt(0))
+		if err != nil {
+			appendRealTradeLog(fmt.Sprintf("%s | %s | TX1_SUBMIT_FAIL V2 | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
+			return
+		}
+	}
+	rc1, err := waitReceipt(ctx, ec, tx1.Hash(), 120*time.Second)
+	if err != nil || rc1 == nil || rc1.Status != 1 {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | TX1_FAIL | hash=%s | err=%v", time.Now().Format(time.RFC3339), pairLabel, tx1.Hash().Hex(), err))
+		return
+	}
+
+	// compute amountIn for leg2 = full quote balance
+	qBal, err := erc20Balance(ctx, ec, quote, trader)
+	if err != nil || qBal == nil || qBal.Sign() <= 0 {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | ABORT no_quote_balance | tx1=%s", time.Now().Format(time.RFC3339), pairLabel, tx1.Hash().Hex()))
+		return
+	}
+
+	// leg2 expected out WETH
+	var leg2OutExp *big.Int
+	if v3First {
+		leg2OutExp, err = routerGetAmountsOut(ctx, ec, v2Router, qBal, []common.Address{quote, addrWETH})
+	} else {
+		leg2OutExp, err = quoteV3ExactInputSingle(ctx, ec, quote, addrWETH, fee, qBal)
+	}
+	if err != nil || leg2OutExp == nil || leg2OutExp.Sign() <= 0 {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | ABORT leg2_quote_fail | err=%v | tx1=%s", time.Now().Format(time.RFC3339), pairLabel, err, tx1.Hash().Hex()))
+		return
+	}
+	leg2Min := pctToMinOut(leg2OutExp, realMaxSlippagePct)
+
+	// approvals for leg2
+	var spender2 common.Address
+	if v3First {
+		spender2 = v2Router
+	} else {
+		spender2 = addrUniswapV3Router
+	}
+	if _, err := ensureApprove(ctx, ec, pk, trader, quote, spender2, qBal); err != nil {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | APPROVE_FAIL leg2 | err=%v | tx1=%s", time.Now().Format(time.RFC3339), pairLabel, err, tx1.Hash().Hex()))
+		return
+	}
+
+	// execute leg2
+	var tx2 *types.Transaction
+	if v3First {
+		data, err := uniV2RouterABIv.Pack("swapExactTokensForTokens", qBal, leg2Min, []common.Address{quote, addrWETH}, trader, deadline)
+		if err != nil {
+			return
+		}
+		tx2, err = sendDynamicTx(ctx, ec, pk, trader, &v2Router, data, big.NewInt(0))
+		if err != nil {
+			appendRealTradeLog(fmt.Sprintf("%s | %s | TX2_SUBMIT_FAIL V2 | err=%v | tx1=%s", time.Now().Format(time.RFC3339), pairLabel, err, tx1.Hash().Hex()))
+			return
+		}
+	} else {
+		data, err := v3ExactInputSingleTxData(quote, addrWETH, fee, trader, qBal, leg2Min, deadline)
+		if err != nil {
+			return
+		}
+		tx2, err = sendDynamicTx(ctx, ec, pk, trader, &addrUniswapV3Router, data, big.NewInt(0))
+		if err != nil {
+			appendRealTradeLog(fmt.Sprintf("%s | %s | TX2_SUBMIT_FAIL UniV3 | err=%v | tx1=%s", time.Now().Format(time.RFC3339), pairLabel, err, tx1.Hash().Hex()))
+			return
+		}
+	}
+	rc2, err := waitReceipt(ctx, ec, tx2.Hash(), 120*time.Second)
+	status := "SUCCESS"
+	if err != nil || rc2 == nil || rc2.Status != 1 {
+		status = "FAILED"
+	}
+	hardStopIfLossExceeded(ctx, ec, trader)
+	appendRealTradeLog(fmt.Sprintf("%s | %s | %s | route=%s→%s | estProfit=$%.2f | tx1=%s | tx2=%s",
+		time.Now().Format(time.RFC3339), pairLabel, status, buyName, sellName, estProfitUSD, tx1.Hash().Hex(), tx2.Hash().Hex()))
 }
 
