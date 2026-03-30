@@ -297,7 +297,6 @@ func v3V3BestProfit(
 			if err != nil || pB == (common.Address{}) {
 				continue
 			}
-			_ = pB // just existence
 			wBack, err := quoteV3ExactInputSingle(ctx, ec, quote, addrWETH, feeB, qOut)
 			if err != nil || wBack == nil || wBack.Sign() <= 0 {
 				continue

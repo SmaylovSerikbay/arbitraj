@@ -39,6 +39,8 @@ var (
 	realStartBalanceSet bool
 
 	realMu sync.Mutex
+
+	activeTradeWg sync.WaitGroup
 )
 
 const erc20ABIJSON = `[{"constant":true,"inputs":[{"name":"owner","type":"address"}],"name":"balanceOf","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":true,"inputs":[{"name":"owner","type":"address"},{"name":"spender","type":"address"}],"name":"allowance","outputs":[{"name":"","type":"uint256"}],"type":"function"},{"constant":false,"inputs":[{"name":"spender","type":"address"},{"name":"amount","type":"uint256"}],"name":"approve","outputs":[{"name":"","type":"bool"}],"type":"function"}]`
@@ -326,15 +328,12 @@ func pctToMinOut(expected *big.Int, slippagePct float64) *big.Int {
 		return new(big.Int).Set(expected)
 	}
 	m := 1.0 - (slippagePct / 100.0)
-	if m < 0 {
-		m = 0
-	}
-	// minOut = floor(expected * m)
-	f, _ := new(big.Rat).SetInt(expected).Mul(new(big.Rat).SetInt(expected), new(big.Rat).SetFloat64(m)).Float64()
-	if f <= 0 {
+	if m <= 0 {
 		return big.NewInt(0)
 	}
-	return big.NewInt(int64(f))
+	r := new(big.Rat).SetInt(expected)
+	r.Mul(r, new(big.Rat).SetFloat64(m))
+	return new(big.Int).Div(r.Num(), r.Denom())
 }
 
 func routerGetAmountsOut(ctx context.Context, ec *ethclient.Client, router common.Address, amountIn *big.Int, path []common.Address) (*big.Int, error) {
@@ -408,32 +407,24 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 	if !realTradingEnabled {
 		return
 	}
-	// hard stop check before any tx
-	_, from, err := parseTraderKey()
+	activeTradeWg.Add(1)
+	defer activeTradeWg.Done()
+
+	pk, trader, err := parseTraderKey()
 	if err != nil {
 		log.Printf("[REAL] TRADER_PRIVATE_KEY не задан — пропуск реального исполнения (%s)", pairLabel)
 		return
 	}
-	hardStopIfLossExceeded(ctx, ec, from)
+	hardStopIfLossExceeded(ctx, ec, trader)
 
 	if strings.Contains(buyName, "UniV3") || strings.Contains(sellName, "UniV3") || strings.Contains(buyName, "Aero") || strings.Contains(sellName, "Aero") {
 		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP route=%s→%s | estProfit=$%.2f", time.Now().Format(time.RFC3339), pairLabel, buyName, sellName, estProfitUSD))
 		return
 	}
-	// allow only V2<->V2 (UniswapV2 <-> SushiSwap)
 	isV2 := func(s string) bool { return s == "UniswapV2" || s == "SushiSwap" }
 	if !isV2(buyName) || !isV2(sellName) {
 		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP unsupported=%s→%s | estProfit=$%.2f", time.Now().Format(time.RFC3339), pairLabel, buyName, sellName, estProfitUSD))
 		return
-	}
-
-	pk, trader, err := parseTraderKey()
-	if err != nil {
-		log.Printf("[REAL] key: %v", err)
-		return
-	}
-	if trader != from {
-		// should never happen
 	}
 
 	var buyRouter, sellRouter common.Address
@@ -519,6 +510,9 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 	if !realTradingEnabled {
 		return
 	}
+	activeTradeWg.Add(1)
+	defer activeTradeWg.Done()
+
 	pk, trader, err := parseTraderKey()
 	if err != nil {
 		log.Printf("[REAL] key: %v", err)

@@ -128,10 +128,11 @@ var (
 	lowLiqPrintAt map[string]time.Time // антиспам для [LOW_LIQUIDITY]
 )
 
-const lowLiquiditySuspiciousNetPct = 10.0 // net% после AMM+газ — выше считаем «тонкой» ликвидностью
+const lowLiquiditySuspiciousNetPct = 25.0 // net% после AMM+газ — выше считаем «тонкой» ликвидностью
 
-// maxProfitSlippagePct — при импакте цены выше порога не печатаем PROFIT FOUND (подготовка к реальным сделкам).
-const maxProfitSlippagePct = 0.3
+// maxProfitSlippagePct — при импакте цены выше порога не печатаем PROFIT FOUND.
+// На Base ликвидность часто неглубокая — 1.5% даёт пропускать реальные окна, а realMaxSlippagePct страхует исполнение.
+const maxProfitSlippagePct = 1.5
 
 func init() {
 	var err error
@@ -299,6 +300,7 @@ func tenPowU8(d uint8) *big.Int {
 }
 
 // --- decimals: известные токены Base; неизвестным считаем 18 (мемы часто 18). Для боя нужен decimals() on-chain.
+var tokenDecimalsMu sync.RWMutex
 var tokenDecimals = map[common.Address]uint8{
 	addrWETH:  18,
 	addrUSDC:  6,
@@ -316,10 +318,21 @@ var tokenDecimals = map[common.Address]uint8{
 }
 
 func decimalsOf(a common.Address) uint8 {
-	if d, ok := tokenDecimals[a]; ok {
+	tokenDecimalsMu.RLock()
+	d, ok := tokenDecimals[a]
+	tokenDecimalsMu.RUnlock()
+	if ok {
 		return d
 	}
 	return 18
+}
+
+func setTokenDecimalsIfMissing(a common.Address, d uint8) {
+	tokenDecimalsMu.Lock()
+	if _, ok := tokenDecimals[a]; !ok {
+		tokenDecimals[a] = d
+	}
+	tokenDecimalsMu.Unlock()
 }
 
 func logSkippedPairsEnabled() bool {
@@ -1297,7 +1310,7 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 	// Сводка: только исполнимый по симуляции профит
 	if simPotNet.Sign() > 0 && simNetPct.Cmp(statsOpportunityThreshold) >= 0 {
 		tp.statMu.Lock()
-		allow := time.Since(tp.lastOppSampleAt) >= 5*time.Second
+		allow := time.Since(tp.lastOppSampleAt) >= 1*time.Second
 		if allow {
 			tp.lastOppSampleAt = time.Now()
 		}
@@ -1382,7 +1395,7 @@ var v3OnlyEvalThrottleMu sync.Mutex
 var v3OnlyLastEvalAt = make(map[string]time.Time)
 
 // Ограничение частоты bestV3OnlyProfit при потоке V3 Swap (иначе сотни eth_call/сек на USDC и т.п.).
-const v3OnlyEvalMinGap = 400 * time.Millisecond
+const v3OnlyEvalMinGap = 150 * time.Millisecond
 
 func evaluateV3OnlyOpportunity(parentCtx context.Context, ec *ethclient.Client, quote common.Address, label string) {
 	if !enableV3Arb || ec == nil {
@@ -1603,9 +1616,7 @@ func parseExtraTokenAddresses() []quoteToken {
 			continue
 		}
 		a := common.HexToAddress(p)
-		if _, ok := tokenDecimals[a]; !ok {
-			tokenDecimals[a] = 18
-		}
+		setTokenDecimalsIfMissing(a, 18)
 		out = append(out, quoteToken{a, "WETH/" + p[:8] + "…"})
 	}
 	return out
@@ -1994,6 +2005,7 @@ func runSessionWebSocket(ctx context.Context, wssURL, httpURL string, splitHTTP 
 	go heartbeatMinuteLoop(innerCtx, reg)
 	go statsSummaryLoop(innerCtx)
 	go dexScreenerDiscoverLoop(innerCtx, ecCall, reg, bump)
+	go ethPriceRefreshLoop(innerCtx, ecCall)
 
 	select {
 	case <-ctx.Done():
@@ -2044,6 +2056,7 @@ func runSessionHTTPPoll(ctx context.Context, httpURL string) error {
 	}
 	go autoDiscoverBackground(ctx, ec, reg, nil)
 	go dexScreenerDiscoverLoop(ctx, ec, reg, nil)
+	go ethPriceRefreshLoop(ctx, ec)
 
 	log.Printf("BASE_FORCE_HTTP_POLL: HTTP опрос getReserves (аналитика, не для боя)")
 	callOpts := &bind.CallOpts{Context: ctx}
@@ -2292,6 +2305,47 @@ func loadNotionalAndEthHint() {
 	}
 }
 
+// refreshEthUSDFromV3 запрашивает актуальную цену ETH через QuoterV2 WETH/USDC на Base.
+// Обновляет ethUsdHint, что влияет на оценку газа, notional→WETH конверсию и все USD-расчёты.
+func refreshEthUSDFromV3(ctx context.Context, ec *ethclient.Client) {
+	if ec == nil || !enableV3Arb {
+		return
+	}
+	oneETH := new(big.Int).Set(tenPowU8(18))
+	var usdcOut *big.Int
+	var err error
+	for _, fee := range []uint32{500, 3000, 10000} {
+		usdcOut, err = quoteV3ExactInputSingle(ctx, ec, addrWETH, addrUSDC, fee, oneETH)
+		if err == nil && usdcOut != nil && usdcOut.Sign() > 0 {
+			break
+		}
+	}
+	if usdcOut == nil || usdcOut.Sign() <= 0 {
+		return
+	}
+	price := new(big.Rat).SetFrac(usdcOut, tenPowU8(6))
+	f, _ := price.Float64()
+	if f < 100 || f > 100_000 {
+		return
+	}
+	ethUsdHint = new(big.Rat).Set(price)
+	log.Printf("[ETH PRICE] обновлена: $%.2f (QuoterV2 WETH/USDC)", f)
+}
+
+func ethPriceRefreshLoop(ctx context.Context, ec *ethclient.Client) {
+	refreshEthUSDFromV3(ctx, ec)
+	t := time.NewTicker(5 * time.Minute)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			refreshEthUSDFromV3(ctx, ec)
+		}
+	}
+}
+
 func loadDotEnv() {
 	try := []string{".env"}
 	if exe, err := os.Executable(); err == nil {
@@ -2361,6 +2415,7 @@ func main() {
 		case <-rootCtx.Done():
 			cancelSess()
 			<-errDone
+			activeTradeWg.Wait()
 			log.Printf("shutdown: %v", rootCtx.Err())
 			printStatsSummaryBlock()
 			return

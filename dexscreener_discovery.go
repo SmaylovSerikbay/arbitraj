@@ -27,9 +27,9 @@ var addrUSDTBase = common.HexToAddress("0xfde4C96c8593536E31F229EA8f37b2ADa2699b
 
 var (
 	dexScreenerDiscoverEnabled = true
-	dexScreenerPollInterval    = time.Hour
-	dexScreenerMinLiqUSD       = 15_000.0
-	dexScreenerTopN            = 30
+	dexScreenerPollInterval    = 10 * time.Minute
+	dexScreenerMinLiqUSD       = 5_000.0
+	dexScreenerTopN            = 50
 
 	dexHTTPClient = &http.Client{Timeout: 60 * time.Second}
 )
@@ -244,9 +244,7 @@ func dexScreenerDiscoverOnce(ctx context.Context, ec *ethclient.Client, reg *reg
 		if wasMonitored {
 			continue
 		}
-		if _, ok := tokenDecimals[addr]; !ok {
-			tokenDecimals[addr] = 18
-		}
+		setTokenDecimalsIfMissing(addr, 18)
 		label := "WETH/" + addr.Hex()[:10] + "…"
 		_, err := reg.tryRegisterWETHPair(ctx, ec, addr, label, autoMinWethPerPool)
 		if err != nil && !isRPCThroughputErr(err) {
