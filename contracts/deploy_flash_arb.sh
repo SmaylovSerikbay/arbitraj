@@ -30,7 +30,9 @@ echo "RPC (первые 40 символов): ${RPC:0:40}..."
 echo "Длина ключа (символов): ${#KEY}"
 
 cd "$ROOT/contracts"
+# Foundry 1.5+: без --broadcast tx в сеть не уходит (только симуляция + ABI).
 forge create src/FlashArb.sol:FlashArb \
+  --broadcast \
   --rpc-url "$RPC" \
   --private-key "$KEY" \
   --constructor-args 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5

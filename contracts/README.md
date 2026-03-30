@@ -30,6 +30,7 @@ chmod +x contracts/deploy_flash_arb.sh
 ```powershell
 cd contracts
 forge create src/FlashArb.sol:FlashArb `
+  --broadcast `
   --rpc-url $env:RPC_URL_DRPC `
   --private-key $env:DEPLOYER_PRIVATE_KEY `
   --constructor-args 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5
@@ -39,6 +40,7 @@ forge create src/FlashArb.sol:FlashArb `
 
 ```bash
 forge create src/FlashArb.sol:FlashArb \
+  --broadcast \
   --rpc-url "$RPC_URL_DRPC" \
   --private-key "$DEPLOYER_PRIVATE_KEY" \
   --constructor-args 0xA238Dd80C259a72e81d7e4664a9801593F98d1c5
