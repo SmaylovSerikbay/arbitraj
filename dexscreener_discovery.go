@@ -28,7 +28,7 @@ var addrUSDTBase = common.HexToAddress("0xfde4C96c8593536E31F229EA8f37b2ADa2699b
 var (
 	dexScreenerDiscoverEnabled = true
 	dexScreenerPollInterval    = time.Hour
-	dexScreenerMinLiqUSD       = 10_000.0
+	dexScreenerMinLiqUSD       = 15_000.0
 	dexScreenerTopN            = 30
 
 	dexHTTPClient = &http.Client{Timeout: 60 * time.Second}

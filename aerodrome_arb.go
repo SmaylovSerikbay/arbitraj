@@ -35,6 +35,8 @@ var (
 	v3OnlyEvalCalls  uint64
 	v3OnlyV3V3Wins   uint64
 	v3OnlyV3AeroWins uint64
+	aeroBestWethUp   uint64
+	aeroNetPositive  uint64
 )
 
 func init() {
@@ -73,7 +75,7 @@ func getAerodromePool(ctx context.Context, ec *ethclient.Client, tokenA, tokenB 
 		return common.Address{}, err
 	}
 	msg := ethereum.CallMsg{To: &addrAerodromeFactory, Data: data}
-	out, err := ec.CallContract(ctx, msg, nil)
+	out, err := callContractRetry(ctx, ec, msg, nil)
 	if err != nil {
 		return common.Address{}, err
 	}
@@ -93,7 +95,7 @@ func quoteAeroGetAmountOut(ctx context.Context, ec *ethclient.Client, pool commo
 		return nil, err
 	}
 	msg := ethereum.CallMsg{To: &pool, Data: data}
-	out, err := ec.CallContract(ctx, msg, nil)
+	out, err := callContractRetry(ctx, ec, msg, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -180,9 +182,15 @@ func v3AeroHybridBestProfit(
 	if bestWei == nil || bestWei.Sign() <= 0 || bBuy == "" {
 		return nil, "", "", false
 	}
+	if bestWei.Cmp(wethIn) > 0 {
+		atomic.AddUint64(&aeroBestWethUp, 1)
+	}
 	profitWei := new(big.Int).Sub(bestWei, wethIn)
 	pUSD := new(big.Rat).Mul(new(big.Rat).SetFrac(profitWei, tenPowU8(18)), ethUsdHint)
 	pot := new(big.Rat).Sub(pUSD, gasHybrid)
+	if pot.Sign() > 0 {
+		atomic.AddUint64(&aeroNetPositive, 1)
+	}
 	return pot, bBuy, bSell, true
 }
 
@@ -227,4 +235,8 @@ func v3OnlyTelemetrySnapshot() (evals, v3v3, v3aero uint64) {
 	return atomic.LoadUint64(&v3OnlyEvalCalls),
 		atomic.LoadUint64(&v3OnlyV3V3Wins),
 		atomic.LoadUint64(&v3OnlyV3AeroWins)
+}
+
+func aeroHybridOppTelemetrySnapshot() (bestUp, netPos uint64) {
+	return atomic.LoadUint64(&aeroBestWethUp), atomic.LoadUint64(&aeroNetPositive)
 }

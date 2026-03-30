@@ -43,6 +43,8 @@ var (
 	hybridOk            uint64
 	hybridPositiveNet   uint64
 	hybridBestWethUp    uint64 // bestWei > wethIn
+	v3V3BestWethUp      uint64
+	v3V3NetPositive     uint64
 )
 
 func init() {
@@ -82,7 +84,7 @@ func getV3Pool(ctx context.Context, ec *ethclient.Client, tokenA, tokenB common.
 		return common.Address{}, err
 	}
 	msg := ethereum.CallMsg{To: &addrUniswapV3Factory, Data: data}
-	out, err := ec.CallContract(ctx, msg, nil)
+	out, err := callContractRetry(ctx, ec, msg, nil)
 	if err != nil {
 		return common.Address{}, err
 	}
@@ -117,7 +119,7 @@ func quoteV3ExactInputSingle(ctx context.Context, ec *ethclient.Client, tokenIn,
 		return nil, err
 	}
 	msg := ethereum.CallMsg{To: &addrQuoterV2Base, Data: data}
-	out, err := ec.CallContract(ctx, msg, nil)
+	out, err := callContractRetry(ctx, ec, msg, nil)
 	if err != nil {
 		atomic.AddUint64(&quoterErr, 1)
 		return nil, err
@@ -145,10 +147,10 @@ func hybridV3V2BestProfit(
 	wethIsT0 bool,
 	u0, u1, s0, s1 *big.Int,
 	baseGasUSD *big.Rat,
-) (potNet *big.Rat, buyName, sellName string, ok bool) {
+) (potNet *big.Rat, buyName, sellName string, ok bool, bestWeiOut *big.Int) {
 	atomic.AddUint64(&hybridEvalCalls, 1)
 	if ec == nil || wethIn == nil || wethIn.Sign() <= 0 {
-		return nil, "", "", false
+		return nil, "", "", false, nil
 	}
 	gasHybrid := new(big.Rat).Mul(baseGasUSD, hybridGasMult)
 
@@ -217,7 +219,7 @@ func hybridV3V2BestProfit(
 	}
 
 	if bestWei == nil || bestWei.Sign() <= 0 || bBuy == "" {
-		return nil, "", "", false
+		return nil, "", "", false, nil
 	}
 	atomic.AddUint64(&hybridOk, 1)
 	if bestWei.Cmp(wethIn) > 0 {
@@ -229,7 +231,7 @@ func hybridV3V2BestProfit(
 	if pot.Sign() > 0 {
 		atomic.AddUint64(&hybridPositiveNet, 1)
 	}
-	return pot, bBuy, bSell, true
+	return pot, bBuy, bSell, true, new(big.Int).Set(bestWei)
 }
 
 func v3TelemetrySnapshot() (getPoolC, getPoolOKC, qC, qOKC, qErrC, hyC, hyOKC, hyUpC, hyPosC uint64) {
@@ -242,6 +244,10 @@ func v3TelemetrySnapshot() (getPoolC, getPoolOKC, qC, qOKC, qErrC, hyC, hyOKC, h
 		atomic.LoadUint64(&hybridOk),
 		atomic.LoadUint64(&hybridBestWethUp),
 		atomic.LoadUint64(&hybridPositiveNet)
+}
+
+func v3V3OppTelemetrySnapshot() (bestUp, netPos uint64) {
+	return atomic.LoadUint64(&v3V3BestWethUp), atomic.LoadUint64(&v3V3NetPositive)
 }
 
 // v3V3BestProfit — round-trip WETH -> quote (feeA) -> WETH (feeB), best net USD after gas.
@@ -302,9 +308,15 @@ func v3V3BestProfit(
 	if bestWei == nil || bestWei.Sign() <= 0 || bBuy == "" {
 		return nil, "", "", false
 	}
+	if bestWei.Cmp(wethIn) > 0 {
+		atomic.AddUint64(&v3V3BestWethUp, 1)
+	}
 	profitWei := new(big.Int).Sub(bestWei, wethIn)
 	pUSD := new(big.Rat).Mul(new(big.Rat).SetFrac(profitWei, tenPowU8(18)), ethUsdHint)
 	pot := new(big.Rat).Sub(pUSD, gasV3V3)
+	if pot.Sign() > 0 {
+		atomic.AddUint64(&v3V3NetPositive, 1)
+	}
 	return pot, bBuy, bSell, true
 }
 
@@ -327,4 +339,42 @@ func ethClientForV3() *ethclient.Client {
 	gasOracleMu.Lock()
 	defer gasOracleMu.Unlock()
 	return gasOracleClient
+}
+
+// estimateV3WETHInSlippagePct — кривизна Quoter WETH→quote относительно линейной экстраполяции мелкой сделки (оценка импакта при NOTIONAL).
+func estimateV3WETHInSlippagePct(ctx context.Context, ec *ethclient.Client, quote common.Address, wethIn *big.Int) float64 {
+	if ec == nil || wethIn == nil || wethIn.Sign() <= 0 {
+		return 0
+	}
+	tiny := new(big.Int).Div(wethIn, big.NewInt(500))
+	if tiny.Cmp(big.NewInt(1)) < 0 {
+		tiny = big.NewInt(1)
+	}
+	bestSlip := 0.0
+	for _, fee := range []uint32{3000, 500, 10000, 100} {
+		p, err := getV3Pool(ctx, ec, addrWETH, quote, fee)
+		if err != nil || p == (common.Address{}) {
+			continue
+		}
+		full, e1 := quoteV3ExactInputSingle(ctx, ec, addrWETH, quote, fee, wethIn)
+		sm, e2 := quoteV3ExactInputSingle(ctx, ec, addrWETH, quote, fee, tiny)
+		if e1 != nil || e2 != nil || full == nil || sm == nil || sm.Sign() == 0 {
+			continue
+		}
+		lin := new(big.Int).Mul(sm, wethIn)
+		lin.Div(lin, tiny)
+		if lin.Sign() == 0 {
+			continue
+		}
+		rf := new(big.Rat).SetFrac(full, lin)
+		f, _ := rf.Float64()
+		if f >= 1 {
+			continue
+		}
+		slip := (1 - f) * 100
+		if slip > bestSlip {
+			bestSlip = slip
+		}
+	}
+	return bestSlip
 }

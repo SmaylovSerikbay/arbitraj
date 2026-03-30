@@ -6,7 +6,8 @@
 // Бумажный режим: нет on-chain проверок на honeypot/налог 99%% — смотрите только как справочную
 // картину; в бой без симуляции sell и аудита контракта нельзя.
 //
-// Base RPC: BASE_HTTP / BASE_WSS, MIN_NET_PROFIT_PCT, NOTIONAL_USD (размер «банка» для AMM-симуляции),
+// Base RPC: BASE_WSS или ALCHEMY_WSS (события), RPC_URL_DRPC или BASE_HTTP (eth_call/Quoter при split),
+// MIN_NET_PROFIT_PCT, NOTIONAL_USD (размер «банка» для AMM-симуляции),
 // ETH_USD_HINT — грубая цена ETH в USD для перевода $ → WETH и для оценки газа в USD (не оракул).
 // AUTO_DISCOVER (по умолчанию вкл.): скан PairCreated на Uniswap V2, кандидаты с парой на Sushi + min WETH в обоих пулах,
 // до AUTO_PAIR_TARGET пар. AUTO_LOG_BLOCK_SPAN / AUTO_LOG_CHUNK / AUTO_MAX_CANDIDATES / AUTO_MIN_WETH_WEI.
@@ -129,6 +130,9 @@ var (
 
 const lowLiquiditySuspiciousNetPct = 10.0 // net% после AMM+газ — выше считаем «тонкой» ликвидностью
 
+// maxProfitSlippagePct — при импакте цены выше порога не печатаем PROFIT FOUND (подготовка к реальным сделкам).
+const maxProfitSlippagePct = 0.3
+
 func init() {
 	var err error
 	factoryParsedABI, err = abi.JSON(strings.NewReader(factoryABIJSON))
@@ -150,8 +154,8 @@ func init() {
 	minNetProfitThreshold = big.NewRat(5, 10)
 	minNetProfitBase = new(big.Rat).Set(minNetProfitThreshold)
 	statsOpportunityThreshold = big.NewRat(5, 10)
-	gasUsdHighExtraMinNet = big.NewRat(35, 100)     // $0.35 — выше этого газа поднимаем планку
-	minNetExtraPctWhenGasHigh = big.NewRat(2, 10) // +0.2% к MIN_NET_PROFIT_PCT
+	gasUsdHighExtraMinNet = big.NewRat(50, 100)    // $0.50 — выше этого газа поднимаем планку
+	minNetExtraPctWhenGasHigh = big.NewRat(1, 10) // +0.1% к MIN_NET_PROFIT_PCT
 }
 
 // Счётчики событий WebSocket (atomic).
@@ -256,8 +260,20 @@ func printStatsSummaryBlock() {
 		fmt.Printf("Best Single Trade: —\n")
 	}
 	fmt.Printf("Current Bank Projection: +%.1f%%\n", proj)
+	fmt.Printf("RPC Status: %s | Errors: %s\n", getStatsRPCOverview(), formatWithCommas(RPCQuoteHardFailures()))
+	gpC, gpOK, qC, qOK, qErr, hyC, hyOK, hyUp, hyPos := v3TelemetrySnapshot()
+	v3v3Up, v3v3Net := v3V3OppTelemetrySnapshot()
+	aUp, aNet := aeroHybridOppTelemetrySnapshot()
+	totOpp := hyUp + v3v3Up + aUp
+	totNet := hyPos + v3v3Net + aNet
+	eff := 0.0
+	if totOpp > 0 {
+		eff = float64(totNet) / float64(totOpp) * 100.0
+	}
+	fmt.Printf("Total Opportunities (bestWei>wIn): %s\n", formatWithCommas(totOpp))
+	fmt.Printf("Net Wins (net>0 after gas): %s\n", formatWithCommas(totNet))
+	fmt.Printf("Efficiency: %.2f%%\n", eff)
 	if enableV3Arb {
-		gpC, gpOK, qC, qOK, qErr, hyC, hyOK, hyUp, hyPos := v3TelemetrySnapshot()
 		fmt.Printf("V3/Quoter: getPool ok %s/%s | quote ok %s/%s (err %s) | hybrid ok %s/%s | bestWei>wIn %s | net>0 %s\n",
 			formatWithCommas(gpOK), formatWithCommas(gpC),
 			formatWithCommas(qOK), formatWithCommas(qC), formatWithCommas(qErr),
@@ -844,7 +860,7 @@ func discoverUniWETHQuoteAddresses(ctx context.Context, ec *ethclient.Client, re
 		}
 		logs, err := fetchUniPairCreatedLogs(ctx, ec, lo, hi)
 		if err != nil {
-			if !isGetLogsBlockRangeLimitErr(err) {
+			if !isGetLogsBlockRangeLimitErr(err) && !isAlchemyThroughputNoise(err) {
 				log.Printf("AUTO_DISCOVER: FilterLogs %d-%d окончательно: %v", lo, hi, err)
 			}
 			if lo >= hi {
@@ -900,7 +916,9 @@ func autoDiscoverFillRegistry(ctx context.Context, ec *ethclient.Client, reg *re
 	}
 	quotes, err := discoverUniWETHQuoteAddresses(ctx, ec, reg)
 	if err != nil {
-		log.Printf("AUTO_DISCOVER: скан логов Uni PairCreated: %v", err)
+		if !isAlchemyThroughputNoise(err) {
+			log.Printf("AUTO_DISCOVER: скан логов Uni PairCreated: %v", err)
+		}
 		return
 	}
 	log.Printf("AUTO_DISCOVER: уникальных кандидатов из логов: %d (оценка ликвидности…)", len(quotes))
@@ -944,7 +962,7 @@ scoring:
 		}
 		label := "WETH/" + row.q.Hex()[:10] + "…"
 		_, err := reg.tryRegisterWETHPair(ctx, ec, row.q, label, autoMinWethPerPool)
-		if err != nil {
+		if err != nil && !isRPCThroughputErr(err) && !isAlchemyThroughputNoise(err) {
 			log.Printf("AUTO_DISCOVER: %s: %v", label, err)
 		}
 	}
@@ -1002,7 +1020,7 @@ func dynamicGasUSD() *big.Rat {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
 	defer cancel()
-	gp, err := c.SuggestGasPrice(ctx)
+	gp, err := suggestGasPriceRetry(ctx, c)
 	if err != nil || gp == nil || gp.Sign() <= 0 {
 		gp = big.NewInt(20_000_000) // ~0.02 gwei фоллбэк
 	}
@@ -1086,6 +1104,50 @@ func simulateWETHRoundTrip(
 		return nil, false
 	}
 	return wethBack, true
+}
+
+// spotRoundTripWETHWeiRat — маржинальный round-trip WETH→token→WETH по резервам V2 (997/1000 на ногу), без учёта кривизны пула.
+func spotRoundTripWETHWeiRat(wethIsT0 bool, buyR0, buyR1, sellR0, sellR1 *big.Int, wIn *big.Int) *big.Rat {
+	if wIn == nil || wIn.Sign() <= 0 {
+		return big.NewRat(0, 1)
+	}
+	feeN := big.NewInt(997)
+	feeD := big.NewInt(1000)
+	var mBuy, mSell *big.Rat
+	if wethIsT0 {
+		mBuy = new(big.Rat).SetFrac(new(big.Int).Mul(feeN, buyR1), new(big.Int).Mul(feeD, buyR0))
+		mSell = new(big.Rat).SetFrac(new(big.Int).Mul(feeN, sellR0), new(big.Int).Mul(feeD, sellR1))
+	} else {
+		mBuy = new(big.Rat).SetFrac(new(big.Int).Mul(feeN, buyR0), new(big.Int).Mul(feeD, buyR1))
+		mSell = new(big.Rat).SetFrac(new(big.Int).Mul(feeN, sellR1), new(big.Int).Mul(feeD, sellR0))
+	}
+	t := new(big.Rat).SetInt(wIn)
+	t.Mul(t, mBuy)
+	t.Mul(t, mSell)
+	return t
+}
+
+// roundTripSlippageVsSpotPct — насколько фактический выход WETH ниже маржинального референса (%); 0 если лучше референса.
+func roundTripSlippageVsSpotPct(wethIsT0 bool, buyR0, buyR1, sellR0, sellR1, wIn, wBack *big.Int) float64 {
+	if wBack == nil || wIn == nil || wIn.Sign() <= 0 || wBack.Sign() <= 0 {
+		return 0
+	}
+	ref := spotRoundTripWETHWeiRat(wethIsT0, buyR0, buyR1, sellR0, sellR1, wIn)
+	if ref.Sign() <= 0 {
+		return 0
+	}
+	wBR := new(big.Rat).SetInt(wBack)
+	if ref.Cmp(wBR) <= 0 {
+		return 0
+	}
+	diff := new(big.Rat).Sub(ref, wBR)
+	pct := new(big.Rat).Quo(diff, ref)
+	pct.Mul(pct, big.NewRat(100, 1))
+	f, _ := pct.Float64()
+	if f < 0 {
+		return 0
+	}
+	return f
 }
 
 func wethSideReserve(r0, r1 *big.Int, wethIsToken0 bool) *big.Int {
@@ -1180,10 +1242,12 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 
 	wethBack, simOK := simulateWETHRoundTrip(wethIsT0, buyR0, buyR1, sellR0, sellR1, wethIn)
 	var simPotNet big.Rat
+	var execWethBack *big.Int
 	if simOK {
 		profitWei := new(big.Int).Sub(wethBack, wethIn)
 		simProfitUSD := new(big.Rat).Mul(new(big.Rat).SetFrac(profitWei, tenPowU8(18)), ethUsdHint)
 		simPotNet.Sub(simProfitUSD, gasUSD)
+		execWethBack = new(big.Int).Set(wethBack)
 	}
 	var quoteTok common.Address
 	if wethIsT0 {
@@ -1194,11 +1258,14 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 	if enableV3Arb {
 		if ec := ethClientForV3(); ec != nil {
 			ctxH, cancel := context.WithTimeout(context.Background(), 8*time.Second)
-			hyPot, hyBuy, hySell, hyOk := hybridV3V2BestProfit(ctxH, ec, quoteTok, wethIn, wethIsT0, u0, u1, s0, s1, gasUSD)
+			hyPot, hyBuy, hySell, hyOk, hyWeiOut := hybridV3V2BestProfit(ctxH, ec, quoteTok, wethIn, wethIsT0, u0, u1, s0, s1, gasUSD)
 			cancel()
 			if hyOk && (simPotNet.Sign() <= 0 || hyPot.Cmp(&simPotNet) > 0) {
 				simPotNet.Set(hyPot)
 				buyName, sellName = hyBuy, hySell
+				if hyWeiOut != nil {
+					execWethBack = new(big.Int).Set(hyWeiOut)
+				}
 			}
 		}
 	}
@@ -1261,6 +1328,23 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 
 	if !shouldPrint(printNet, buyName, sellName, tp.label, spamPrintMode) {
 		return
+	}
+	if simPotNet.Sign() > 0 && execWethBack != nil && execWethBack.Sign() > 0 {
+		v2s := roundTripSlippageVsSpotPct(wethIsT0, buyR0, buyR1, sellR0, sellR1, wethIn, execWethBack)
+		v3s := 0.0
+		if strings.Contains(buyName, "UniV3") || strings.Contains(sellName, "UniV3") {
+			if ec := ethClientForV3(); ec != nil {
+				ctxS, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+				v3s = estimateV3WETHInSlippagePct(ctxS, ec, quoteTok, wethIn)
+				cancel()
+			}
+		}
+		if v2s > maxProfitSlippagePct || v3s > maxProfitSlippagePct {
+			ts := time.Now().Format("15:04:05.000")
+			fmt.Printf("[%s] [LOW LIQUIDITY - SKIPPED] %s | BUY: %s | SELL: %s | slip V2ref=%.3f%% V3est=%.3f%% (max %.2f%%)\n",
+				ts, tp.label, buyName, sellName, v2s, v3s, maxProfitSlippagePct)
+			return
+		}
 	}
 	ts := time.Now().Format("15:04:05.000")
 	nf, _ := ratNotional.Float64()
@@ -1335,6 +1419,15 @@ func evaluateV3OnlyOpportunity(parentCtx context.Context, ec *ethclient.Client, 
 	if !shouldPrint(netF, buy, sell, label, spamPrintMode) {
 		return
 	}
+	ctxS, cancelS := context.WithTimeout(parentCtx, 6*time.Second)
+	slipV3 := estimateV3WETHInSlippagePct(ctxS, ec, quote, wethIn)
+	cancelS()
+	if slipV3 > maxProfitSlippagePct {
+		ts := time.Now().Format("15:04:05.000")
+		log.Printf("[%s] [LOW LIQUIDITY - SKIPPED] %s | BUY: %s | SELL: %s | V3 slip est=%.3f%% (max %.2f%%)",
+			ts, label, buy, sell, slipV3, maxProfitSlippagePct)
+		return
+	}
 	ts := time.Now().Format("15:04:05.000")
 	nf, _ := ratNotional.Float64()
 	log.Printf("[%s] PROFIT FOUND: %.3f%% NET(sim,$%.0f V3-only gas~$%.4f) | %s | BUY: %s | SELL: %s | POTENTIAL: $%.2f",
@@ -1364,7 +1457,7 @@ func getPair(ctx context.Context, ec *ethclient.Client, factory, a, b common.Add
 		return common.Address{}, err
 	}
 	msg := ethereum.CallMsg{To: &factory, Data: data}
-	out, err := ec.CallContract(ctx, msg, nil)
+	out, err := callContractRetry(ctx, ec, msg, nil)
 	if err != nil {
 		return common.Address{}, err
 	}
@@ -1851,6 +1944,15 @@ func runSessionWebSocket(ctx context.Context, wssURL, httpURL string, splitHTTP 
 		defer hc.Close()
 		callCli = hc
 	}
+	if splitHTTP && httpURL != "" {
+		if strings.TrimSpace(os.Getenv("RPC_URL_DRPC")) != "" {
+			setStatsRPCOverview("Alchemy(WSS) + dRPC(HTTP)")
+		} else {
+			setStatsRPCOverview("WebSocket(WSS) + HTTP(calls)")
+		}
+	} else {
+		setStatsRPCOverview("WebSocket only")
+	}
 	ecCall, _ := callCli.(*ethclient.Client)
 	setGasOracleClient(ecCall)
 	defer setGasOracleClient(nil)
@@ -1922,6 +2024,7 @@ func runSessionHTTPPoll(ctx context.Context, httpURL string) error {
 	defer ec.Close()
 	setGasOracleClient(ec)
 	defer setGasOracleClient(nil)
+	setStatsRPCOverview("HTTP polling (BASE_FORCE_HTTP_POLL)")
 	reg := newRegistry()
 	if err := bootstrapRegistry(ctx, ec, reg); err != nil {
 		return err
@@ -1999,8 +2102,18 @@ func schemeWSToHTTP(u string) string {
 }
 
 func loadRPCEndpoints() (wss string, http string, splitHTTP bool) {
+	drpc := strings.TrimSpace(os.Getenv("RPC_URL_DRPC"))
 	h := strings.TrimSpace(os.Getenv("BASE_HTTP"))
 	w := strings.TrimSpace(os.Getenv("BASE_WSS"))
+	if w == "" {
+		w = strings.TrimSpace(os.Getenv("ALCHEMY_WSS"))
+	}
+	if drpc != "" {
+		if w == "" {
+			return "", "", false
+		}
+		return w, drpc, true
+	}
 	useHTTPCalls := strings.TrimSpace(os.Getenv("BASE_USE_HTTP_FOR_CALLS")) == "1"
 	switch {
 	case w == "" && h == "":
@@ -2022,7 +2135,7 @@ func ensureWSSURL(wss string) string {
 		return schemeHTTPToWS(wss)
 	}
 	if !strings.HasPrefix(low, "wss://") && !strings.HasPrefix(low, "ws://") {
-		log.Fatal("BASE_WSS должен начинаться с wss:// или ws:// (WebSocket RPC для eth_subscribe)")
+		log.Fatal("BASE_WSS / ALCHEMY_WSS должен начинаться с wss:// или ws:// (WebSocket RPC для eth_subscribe)")
 	}
 	return wss
 }
@@ -2197,15 +2310,18 @@ func main() {
 
 	wss, http, splitHTTP := loadRPCEndpoints()
 	if wss == "" {
-		log.Fatal("задайте BASE_HTTP и/или BASE_WSS (например Alchemy Base)")
+		log.Fatal("задайте BASE_WSS или ALCHEMY_WSS для событий; при RPC_URL_DRPC — WSS обязателен")
 	}
 	if strings.TrimSpace(os.Getenv("BASE_FORCE_HTTP_POLL")) != "1" {
 		wss = ensureWSSURL(wss)
 	}
-	if splitHTTP {
-		log.Printf("RPC: HTTP (вызовы) + WSS (Sync + PairCreated)")
-	} else {
-		log.Printf("RPC: один WebSocket — Sync на все пулы + PairCreated с фабрик")
+	switch {
+	case strings.TrimSpace(os.Getenv("RPC_URL_DRPC")) != "":
+		log.Printf("RPC: Alchemy/WebSocket (Sync, PairCreated, V3 Swap) + dRPC (eth_call, Quoter, газ)")
+	case splitHTTP:
+		log.Printf("RPC: WebSocket (события) + HTTP (вызовы)")
+	default:
+		log.Printf("RPC: один WebSocket — события и вызовы на одном соединении")
 	}
 
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -2237,7 +2353,11 @@ func main() {
 		case err := <-errDone:
 			cancelSess()
 			if err != nil && !errors.Is(err, context.Canceled) {
-				log.Printf("session ended: %v; reconnect in %v", err, delay)
+				if isAlchemyThroughputNoise(err) {
+					log.Printf("session: лимит WSS-провайдера, переподключение через %v", delay)
+				} else {
+					log.Printf("session ended: %v; reconnect in %v", err, delay)
+				}
 				select {
 				case <-time.After(delay):
 				case <-rootCtx.Done():
