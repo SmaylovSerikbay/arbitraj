@@ -2370,6 +2370,7 @@ func main() {
 	loadGasAdaptiveMinNetProfit()
 	loadStatsOpportunityThreshold()
 	loadRealTradingSettings()
+	loadFlashArbSettings()
 	spamPrintMode = minNetProfitThreshold.Sign() <= 0
 	if spamPrintMode {
 		log.Printf("режим теста: MIN_NET_PROFIT_PCT≤0 — печать микроспредов (верните порог 0.3–0.5 для нормальной работы)")

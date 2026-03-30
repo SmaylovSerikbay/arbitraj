@@ -427,6 +427,15 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 		return
 	}
 
+	if flashArbContract == (common.Address{}) {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP FLASH_ARB_CONTRACT unset | estProfit=$%.2f", time.Now().Format(time.RFC3339), pairLabel, estProfitUSD))
+		return
+	}
+	if isFlashBadToken(quote) {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP flash bad-token cache | quote=%s", time.Now().Format(time.RFC3339), pairLabel, quote.Hex()))
+		return
+	}
+
 	var buyRouter, sellRouter common.Address
 	if buyName == "UniswapV2" {
 		buyRouter = addrUniswapV2Router
@@ -439,73 +448,83 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 		sellRouter = addrSushiV2Router
 	}
 
-	// expected outs by current reserves (already in tp); use AMM formula.
-	// First leg: WETH -> quote
-	// We don't have reserves here; so in real mode we require that caller already decided V2 route and we do minimal slippage only.
-	// amountOutMin computed as amountIn * (1 - slippage) just to cap tax tokens; conservative.
-	outMin1 := pctToMinOut(wethIn, realMaxSlippagePct)
-	outMin2 := pctToMinOut(wethIn, realMaxSlippagePct)
+	amount := flashAmountForTrade(wethIn)
+	if amount.Sign() <= 0 {
+		return
+	}
 
-	// approvals
-	ctxA, cancelA := context.WithTimeout(ctx, 20*time.Second)
+	ctxA, cancelA := context.WithTimeout(ctx, 25*time.Second)
 	defer cancelA()
-	if _, err := ensureApprove(ctxA, ec, pk, trader, addrWETH, buyRouter, wethIn); err != nil {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | APPROVE_FAIL WETH->%s | err=%v", time.Now().Format(time.RFC3339), pairLabel, buyName, err))
+
+	bps, errPrem := aaveFlashPremiumBps(ctxA, ec)
+	if errPrem != nil {
+		bps = 5 // 0.05% по умолчанию (Aave V3 Base)
+	}
+	prem := aavePremiumWei(amount, bps)
+	repay := new(big.Int).Add(amount, prem)
+
+	leg1Exp, err := routerGetAmountsOut(ctxA, ec, buyRouter, amount, []common.Address{addrWETH, quote})
+	if err != nil || leg1Exp == nil || leg1Exp.Sign() <= 0 {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_ABORT leg1_quote | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
+		return
+	}
+	minTok := minTokenAfterBuyLeg1(leg1Exp)
+
+	leg2Exp, err := routerGetAmountsOut(ctxA, ec, sellRouter, minTok, []common.Address{quote, addrWETH})
+	if err != nil || leg2Exp == nil || leg2Exp.Sign() <= 0 {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_ABORT leg2_quote | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
+		return
+	}
+	leg2Min := pctToMinOut(leg2Exp, realMaxSlippagePct)
+	needWeth := new(big.Int).Add(repay, flashMinProfitWei)
+	if leg2Min.Cmp(needWeth) < 0 {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP flash leg2Min<repay+minProfit | estProfit=$%.2f", time.Now().Format(time.RFC3339), pairLabel, estProfitUSD))
 		return
 	}
 
-	// swap1
 	deadline := big.NewInt(time.Now().Add(60 * time.Second).Unix())
-	data1, err := uniV2RouterABIv.Pack("swapExactTokensForTokens", wethIn, outMin1, []common.Address{addrWETH, quote}, trader, deadline)
+	buyData, err := uniV2RouterABIv.Pack("swapExactTokensForTokens", amount, minTok, []common.Address{addrWETH, quote}, flashArbContract, deadline)
 	if err != nil {
-		return
-	}
-	tx1, err := sendDynamicTx(ctxA, ec, pk, trader, &buyRouter, data1, big.NewInt(0))
-	if err != nil {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | TX1_SUBMIT_FAIL %s | err=%v", time.Now().Format(time.RFC3339), pairLabel, buyName, err))
-		return
-	}
-	rc1, err := waitReceipt(ctxA, ec, tx1.Hash(), 120*time.Second)
-	if err != nil || rc1 == nil || rc1.Status != 1 {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | TX1_FAIL %s | hash=%s | err=%v", time.Now().Format(time.RFC3339), pairLabel, buyName, tx1.Hash().Hex(), err))
 		return
 	}
 
-	// for swap2 we need current quote balance (all-in)
-	qBal, err := erc20Balance(ctxA, ec, quote, trader)
-	if err != nil || qBal == nil || qBal.Sign() <= 0 {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | TX2_ABORT noQuoteBalance | tx1=%s", time.Now().Format(time.RFC3339), pairLabel, tx1.Hash().Hex()))
-		return
+	args := flashArbArgs{
+		Asset:            addrWETH,
+		Amount:           amount,
+		BuyRouter:        buyRouter,
+		BuyCalldata:      buyData,
+		SellRouter:       sellRouter,
+		QuoteToken:       quote,
+		V3Sell:           false,
+		V3Fee:            0,
+		MinWethOut:       leg2Min,
+		MinTokenAfterBuy: minTok,
+		MinProfitWei:     new(big.Int).Set(flashMinProfitWei),
+		Deadline:         deadline,
 	}
-	if _, err := ensureApprove(ctxA, ec, pk, trader, quote, sellRouter, qBal); err != nil {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | APPROVE_FAIL quote->%s | err=%v", time.Now().Format(time.RFC3339), pairLabel, sellName, err))
+
+	if err := flashArbSimulate(ctxA, ec, trader, args); err != nil {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | err=%v | estProfit=$%.2f", time.Now().Format(time.RFC3339), pairLabel, err, estProfitUSD))
 		return
 	}
 
-	data2, err := uniV2RouterABIv.Pack("swapExactTokensForTokens", qBal, outMin2, []common.Address{quote, addrWETH}, trader, deadline)
+	tx, err := flashArbExecute(ctxA, ec, pk, trader, args)
 	if err != nil {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_TX_SUBMIT_FAIL | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
 		return
 	}
-	tx2, err := sendDynamicTx(ctxA, ec, pk, trader, &sellRouter, data2, big.NewInt(0))
-	if err != nil {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | TX2_SUBMIT_FAIL %s | err=%v | tx1=%s", time.Now().Format(time.RFC3339), pairLabel, sellName, err, tx1.Hash().Hex()))
-		return
-	}
-	rc2, err := waitReceipt(ctxA, ec, tx2.Hash(), 120*time.Second)
+	rc, err := waitReceipt(ctxA, ec, tx.Hash(), 120*time.Second)
 	status := "SUCCESS"
-	if err != nil || rc2 == nil || rc2.Status != 1 {
+	if err != nil || rc == nil || rc.Status != 1 {
 		status = "FAILED"
+		markFlashBadToken(quote)
 	}
-
-	// hard stop after trade
 	hardStopIfLossExceeded(ctxA, ec, trader)
-
-	appendRealTradeLog(fmt.Sprintf("%s | %s | %s | estProfit=$%.2f | tx1=%s | tx2=%s",
-		time.Now().Format(time.RFC3339), pairLabel, status, estProfitUSD, tx1.Hash().Hex(), tx2.Hash().Hex()))
+	appendRealTradeLog(fmt.Sprintf("%s | %s | %s FLASH | estProfit=$%.2f | tx=%s",
+		time.Now().Format(time.RFC3339), pairLabel, status, estProfitUSD, tx.Hash().Hex()))
 }
 
-// executeRealHybridV3V2RoundTrip — исполняет реальный 2-лег маршрут, где одна нога UniV3 exactInputSingle, вторая — V2 router.
-// Поддерживаем только токены WETH<->quote и только один V2 DEX (UniV2 или Sushi) как во внутреннем выборе hyBuy/hySell.
+// executeRealHybridV3V2RoundTrip — один tx: Aave flash loan + UniV3/V2 buy + V2/V3 sell через FlashArb.
 func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLabel string, buyName, sellName string, quote common.Address, wethIn *big.Int, estProfitUSD float64) {
 	if !realTradingEnabled {
 		return
@@ -520,6 +539,19 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 	}
 	hardStopIfLossExceeded(ctx, ec, trader)
 
+	if strings.Contains(buyName, "Aero") || strings.Contains(sellName, "Aero") {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP Aero flash | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, buyName, sellName))
+		return
+	}
+	if flashArbContract == (common.Address{}) {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP FLASH_ARB_CONTRACT unset | estProfit=$%.2f", time.Now().Format(time.RFC3339), pairLabel, estProfitUSD))
+		return
+	}
+	if isFlashBadToken(quote) {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP flash bad-token cache | quote=%s", time.Now().Format(time.RFC3339), pairLabel, quote.Hex()))
+		return
+	}
+
 	fee, ok := parseV3FeeFromTag(buyName)
 	v3First := true
 	if !ok {
@@ -531,7 +563,6 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 		return
 	}
 
-	// Identify V2 router name and address
 	v2Name := buyName
 	if strings.Contains(v2Name, "UniV3") {
 		v2Name = sellName
@@ -539,7 +570,6 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 	var v2Router common.Address
 	switch v2Name {
 	case "UniswapV2", "SushiSwapV2", "SushiSwap":
-		// normalize legacy labels
 		if v2Name == "UniswapV2" {
 			v2Router = addrUniswapV2Router
 		} else {
@@ -550,123 +580,108 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 		return
 	}
 
+	amount := flashAmountForTrade(wethIn)
+	if amount.Sign() <= 0 {
+		return
+	}
+
+	ctxA, cancelA := context.WithTimeout(ctx, 30*time.Second)
+	defer cancelA()
+
+	bps, errPrem := aaveFlashPremiumBps(ctxA, ec)
+	if errPrem != nil {
+		bps = 5
+	}
+	prem := aavePremiumWei(amount, bps)
+	repay := new(big.Int).Add(amount, prem)
+	needWeth := new(big.Int).Add(repay, flashMinProfitWei)
+
 	deadline := big.NewInt(time.Now().Add(60 * time.Second).Unix())
 
-	// leg1 expected out
 	var leg1OutExp *big.Int
 	if v3First {
-		leg1OutExp, err = quoteV3ExactInputSingle(ctx, ec, addrWETH, quote, fee, wethIn)
+		leg1OutExp, err = quoteV3ExactInputSingle(ctxA, ec, addrWETH, quote, fee, amount)
 	} else {
-		leg1OutExp, err = routerGetAmountsOut(ctx, ec, v2Router, wethIn, []common.Address{addrWETH, quote})
+		leg1OutExp, err = routerGetAmountsOut(ctxA, ec, v2Router, amount, []common.Address{addrWETH, quote})
 	}
 	if err != nil || leg1OutExp == nil || leg1OutExp.Sign() <= 0 {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | ABORT leg1_quote_fail | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
+		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_ABORT leg1_quote | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
 		return
 	}
-	leg1Min := pctToMinOut(leg1OutExp, realMaxSlippagePct)
+	minTok := minTokenAfterBuyLeg1(leg1OutExp)
 
-	// approvals for leg1
-	if _, err := ensureApprove(ctx, ec, pk, trader, addrWETH, func() common.Address {
-		if v3First {
-			return addrUniswapV3Router
-		}
-		return v2Router
-	}(), wethIn); err != nil {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | APPROVE_FAIL leg1 | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
-		return
-	}
-
-	// execute leg1
-	var tx1 *types.Transaction
+	var buyRouter common.Address
+	var buyData []byte
 	if v3First {
-		data, err := v3ExactInputSingleTxData(addrWETH, quote, fee, trader, wethIn, leg1Min, deadline)
-		if err != nil {
-			return
-		}
-		tx1, err = sendDynamicTx(ctx, ec, pk, trader, &addrUniswapV3Router, data, big.NewInt(0))
-		if err != nil {
-			appendRealTradeLog(fmt.Sprintf("%s | %s | TX1_SUBMIT_FAIL UniV3 | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
-			return
-		}
+		buyRouter = addrUniswapV3Router
+		buyData, err = v3ExactInputSingleTxData(addrWETH, quote, fee, flashArbContract, amount, minTok, deadline)
 	} else {
-		data, err := uniV2RouterABIv.Pack("swapExactTokensForTokens", wethIn, leg1Min, []common.Address{addrWETH, quote}, trader, deadline)
-		if err != nil {
-			return
-		}
-		tx1, err = sendDynamicTx(ctx, ec, pk, trader, &v2Router, data, big.NewInt(0))
-		if err != nil {
-			appendRealTradeLog(fmt.Sprintf("%s | %s | TX1_SUBMIT_FAIL V2 | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
-			return
-		}
+		buyRouter = v2Router
+		buyData, err = uniV2RouterABIv.Pack("swapExactTokensForTokens", amount, minTok, []common.Address{addrWETH, quote}, flashArbContract, deadline)
 	}
-	rc1, err := waitReceipt(ctx, ec, tx1.Hash(), 120*time.Second)
-	if err != nil || rc1 == nil || rc1.Status != 1 {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | TX1_FAIL | hash=%s | err=%v", time.Now().Format(time.RFC3339), pairLabel, tx1.Hash().Hex(), err))
+	if err != nil {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_ABORT pack_buy | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
 		return
 	}
 
-	// compute amountIn for leg2 = full quote balance
-	qBal, err := erc20Balance(ctx, ec, quote, trader)
-	if err != nil || qBal == nil || qBal.Sign() <= 0 {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | ABORT no_quote_balance | tx1=%s", time.Now().Format(time.RFC3339), pairLabel, tx1.Hash().Hex()))
-		return
-	}
-
-	// leg2 expected out WETH
 	var leg2OutExp *big.Int
+	var v3Sell bool
+	var sellRouter common.Address
+	var v3FeeU32 uint32
 	if v3First {
-		leg2OutExp, err = routerGetAmountsOut(ctx, ec, v2Router, qBal, []common.Address{quote, addrWETH})
+		leg2OutExp, err = routerGetAmountsOut(ctxA, ec, v2Router, minTok, []common.Address{quote, addrWETH})
+		v3Sell = false
+		sellRouter = v2Router
+		v3FeeU32 = 0
 	} else {
-		leg2OutExp, err = quoteV3ExactInputSingle(ctx, ec, quote, addrWETH, fee, qBal)
+		leg2OutExp, err = quoteV3ExactInputSingle(ctxA, ec, quote, addrWETH, fee, minTok)
+		v3Sell = true
+		sellRouter = addrUniswapV3Router
+		v3FeeU32 = fee
 	}
 	if err != nil || leg2OutExp == nil || leg2OutExp.Sign() <= 0 {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | ABORT leg2_quote_fail | err=%v | tx1=%s", time.Now().Format(time.RFC3339), pairLabel, err, tx1.Hash().Hex()))
+		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_ABORT leg2_quote | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
 		return
 	}
 	leg2Min := pctToMinOut(leg2OutExp, realMaxSlippagePct)
-
-	// approvals for leg2
-	var spender2 common.Address
-	if v3First {
-		spender2 = v2Router
-	} else {
-		spender2 = addrUniswapV3Router
-	}
-	if _, err := ensureApprove(ctx, ec, pk, trader, quote, spender2, qBal); err != nil {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | APPROVE_FAIL leg2 | err=%v | tx1=%s", time.Now().Format(time.RFC3339), pairLabel, err, tx1.Hash().Hex()))
+	if leg2Min.Cmp(needWeth) < 0 {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP flash leg2Min<repay+minProfit | estProfit=$%.2f", time.Now().Format(time.RFC3339), pairLabel, estProfitUSD))
 		return
 	}
 
-	// execute leg2
-	var tx2 *types.Transaction
-	if v3First {
-		data, err := uniV2RouterABIv.Pack("swapExactTokensForTokens", qBal, leg2Min, []common.Address{quote, addrWETH}, trader, deadline)
-		if err != nil {
-			return
-		}
-		tx2, err = sendDynamicTx(ctx, ec, pk, trader, &v2Router, data, big.NewInt(0))
-		if err != nil {
-			appendRealTradeLog(fmt.Sprintf("%s | %s | TX2_SUBMIT_FAIL V2 | err=%v | tx1=%s", time.Now().Format(time.RFC3339), pairLabel, err, tx1.Hash().Hex()))
-			return
-		}
-	} else {
-		data, err := v3ExactInputSingleTxData(quote, addrWETH, fee, trader, qBal, leg2Min, deadline)
-		if err != nil {
-			return
-		}
-		tx2, err = sendDynamicTx(ctx, ec, pk, trader, &addrUniswapV3Router, data, big.NewInt(0))
-		if err != nil {
-			appendRealTradeLog(fmt.Sprintf("%s | %s | TX2_SUBMIT_FAIL UniV3 | err=%v | tx1=%s", time.Now().Format(time.RFC3339), pairLabel, err, tx1.Hash().Hex()))
-			return
-		}
+	args := flashArbArgs{
+		Asset:            addrWETH,
+		Amount:           amount,
+		BuyRouter:        buyRouter,
+		BuyCalldata:      buyData,
+		SellRouter:       sellRouter,
+		QuoteToken:       quote,
+		V3Sell:           v3Sell,
+		V3Fee:            v3FeeU32,
+		MinWethOut:       leg2Min,
+		MinTokenAfterBuy: minTok,
+		MinProfitWei:     new(big.Int).Set(flashMinProfitWei),
+		Deadline:         deadline,
 	}
-	rc2, err := waitReceipt(ctx, ec, tx2.Hash(), 120*time.Second)
+
+	if err := flashArbSimulate(ctxA, ec, trader, args); err != nil {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | err=%v | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, err, buyName, sellName))
+		return
+	}
+
+	tx, err := flashArbExecute(ctxA, ec, pk, trader, args)
+	if err != nil {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_TX_SUBMIT_FAIL | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
+		return
+	}
+	rc, err := waitReceipt(ctxA, ec, tx.Hash(), 120*time.Second)
 	status := "SUCCESS"
-	if err != nil || rc2 == nil || rc2.Status != 1 {
+	if err != nil || rc == nil || rc.Status != 1 {
 		status = "FAILED"
+		markFlashBadToken(quote)
 	}
-	hardStopIfLossExceeded(ctx, ec, trader)
-	appendRealTradeLog(fmt.Sprintf("%s | %s | %s | route=%s→%s | estProfit=$%.2f | tx1=%s | tx2=%s",
-		time.Now().Format(time.RFC3339), pairLabel, status, buyName, sellName, estProfitUSD, tx1.Hash().Hex(), tx2.Hash().Hex()))
+	hardStopIfLossExceeded(ctxA, ec, trader)
+	appendRealTradeLog(fmt.Sprintf("%s | %s | %s FLASH hybrid | route=%s→%s | estProfit=$%.2f | tx=%s",
+		time.Now().Format(time.RFC3339), pairLabel, status, buyName, sellName, estProfitUSD, tx.Hash().Hex()))
 }
 
