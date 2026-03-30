@@ -1356,6 +1356,15 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 	gasF, _ := gasUSD.Float64()
 	fmt.Printf("[%s] PROFIT FOUND: %.3f%% NET(sim,$%.0f AMM+gas~$%.4f) | %s | BUY: %s | SELL: %s | POTENTIAL: $%.2f | mid-ref (без слиппеджа): $%.2f\n",
 		ts, simNetF, nf, gasF, tp.label, buyName, sellName, simPotF, midPotF)
+
+	// Реальное исполнение (пока только V2↔V2 UniswapV2 <-> SushiSwap).
+	if realTradingEnabled {
+		if ec := ethClientForV3(); ec != nil { // это call-client (dRPC), выставлен через setGasOracleClient
+			ctxX, cancelX := context.WithTimeout(context.Background(), 25*time.Second)
+			executeRealV2V2RoundTrip(ctxX, ec, tp.label, buyName, sellName, quoteTok, wethIn, simPotF)
+			cancelX()
+		}
+	}
 }
 
 var printMu sync.Mutex
@@ -2302,6 +2311,7 @@ func main() {
 	loadMinNetProfitPct()
 	loadGasAdaptiveMinNetProfit()
 	loadStatsOpportunityThreshold()
+	loadRealTradingSettings()
 	spamPrintMode = minNetProfitThreshold.Sign() <= 0
 	if spamPrintMode {
 		log.Printf("режим теста: MIN_NET_PROFIT_PCT≤0 — печать микроспредов (верните порог 0.3–0.5 для нормальной работы)")
