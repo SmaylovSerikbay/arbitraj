@@ -70,10 +70,15 @@ contract FlashArb is IFlashLoanSimpleReceiver {
     error TaxOrSlippage();
     error SellFailed();
     error ProfitTooLow();
+    error TransferFailed();
 
     modifier onlyOwner() {
-        if (msg.sender != owner) revert NotOwner();
+        _onlyOwner();
         _;
+    }
+
+    function _onlyOwner() internal view {
+        if (msg.sender != owner) revert NotOwner();
     }
 
     constructor(address pool_) {
@@ -94,7 +99,7 @@ contract FlashArb is IFlashLoanSimpleReceiver {
         uint256 bal = IERC20(token).balanceOf(address(this));
         uint256 sendAmt = amount == type(uint256).max ? bal : amount;
         if (sendAmt == 0) return;
-        IERC20(token).transfer(owner, sendAmt);
+        if (!IERC20(token).transfer(owner, sendAmt)) revert TransferFailed();
     }
 
     /// @param v3Sell If true, sellRouter must be UniV3 SwapRouter02-compatible with exactInputSingle
