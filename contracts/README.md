@@ -4,8 +4,17 @@
 
 ```bash
 cd contracts
-forge install foundry-rs/forge-std --no-commit
+forge install foundry-rs/forge-std
 forge build
+```
+
+### Деплой с VDS (рекомендуется)
+
+Из корня репозитория `arbitraj/` — скрипт сам делает `source .env` и подставляет `BASE_HTTP`, если нет `RPC_URL_DRPC`, и `TRADER_PRIVATE_KEY`, если нет `DEPLOYER_PRIVATE_KEY`:
+
+```bash
+chmod +x contracts/deploy_flash_arb.sh
+./contracts/deploy_flash_arb.sh
 ```
 
 Скрипт деплоя (`script/DeployFlashArb.s.sol`) зависит от `forge-std`.
