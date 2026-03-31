@@ -476,12 +476,12 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_ABORT leg2_quote | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
 		return
 	}
-	leg2Min := pctToMinOut(leg2Exp, realMaxSlippagePct)
 	needWeth := new(big.Int).Add(repay, flashMinProfitWei)
-	if leg2Min.Cmp(needWeth) < 0 {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP flash leg2Min<repay+minProfit | estProfit=$%.2f", time.Now().Format(time.RFC3339), pairLabel, estProfitUSD))
+	if leg2Exp.Cmp(needWeth) < 0 {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP flash leg2Exp<repay | estProfit=$%.2f", time.Now().Format(time.RFC3339), pairLabel, estProfitUSD))
 		return
 	}
+	leg2Min := new(big.Int).Set(needWeth)
 
 	deadline := big.NewInt(time.Now().Add(60 * time.Second).Unix())
 	buyData, err := uniV2RouterABIv.Pack("swapExactTokensForTokens", amount, minTok, []common.Address{addrWETH, quote}, flashArbContract, deadline)
@@ -644,11 +644,11 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_ABORT leg2_quote | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
 		return
 	}
-	leg2Min := pctToMinOut(leg2OutExp, realMaxSlippagePct)
-	if leg2Min.Cmp(needWeth) < 0 {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP flash leg2Min<repay+minProfit | estProfit=$%.2f", time.Now().Format(time.RFC3339), pairLabel, estProfitUSD))
+	if leg2OutExp.Cmp(needWeth) < 0 {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP flash leg2Exp<repay | estProfit=$%.2f | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, estProfitUSD, buyName, sellName))
 		return
 	}
+	leg2Min := new(big.Int).Set(needWeth)
 
 	args := flashArbArgs{
 		Asset:            addrWETH,
