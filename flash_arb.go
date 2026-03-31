@@ -55,6 +55,11 @@ var (
 
 	flashBadMu    sync.RWMutex
 	flashBadToken = make(map[common.Address]time.Time)
+
+	cachedPremiumBps   uint64 = 5
+	cachedPremiumAt    time.Time
+	cachedPremiumTTL   = 5 * time.Minute
+	cachedPremiumMu    sync.RWMutex
 )
 
 func init() {
@@ -143,30 +148,37 @@ func markFlashBadToken(tok common.Address) {
 	flashBadMu.Unlock()
 }
 
-func aaveFlashPremiumBps(ctx context.Context, ec *ethclient.Client) (uint64, error) {
+func aaveFlashPremiumBpsCached(ctx context.Context, ec *ethclient.Client) uint64 {
+	cachedPremiumMu.RLock()
+	if time.Since(cachedPremiumAt) < cachedPremiumTTL {
+		v := cachedPremiumBps
+		cachedPremiumMu.RUnlock()
+		return v
+	}
+	cachedPremiumMu.RUnlock()
+
 	pool := common.HexToAddress(aaveV3PoolBase)
 	data, err := aavePoolPremiumParsed.Pack("FLASHLOAN_PREMIUM_TOTAL")
 	if err != nil {
-		return 0, err
+		return cachedPremiumBps
 	}
 	msg := ethereum.CallMsg{To: &pool, Data: data}
 	out, err := callContractRetry(ctx, ec, msg, nil)
 	if err != nil {
-		return 0, err
+		return cachedPremiumBps
 	}
 	vals, err := aavePoolPremiumParsed.Unpack("FLASHLOAN_PREMIUM_TOTAL", out)
 	if err != nil || len(vals) != 1 {
-		return 0, errors.New("premium decode")
+		return cachedPremiumBps
 	}
-	switch v := vals[0].(type) {
-	case *big.Int:
-		if v == nil {
-			return 0, errors.New("nil premium")
-		}
-		return v.Uint64(), nil
-	default:
-		return 0, errors.New("premium type")
+	if v, ok := vals[0].(*big.Int); ok && v != nil {
+		cachedPremiumMu.Lock()
+		cachedPremiumBps = v.Uint64()
+		cachedPremiumAt = time.Now()
+		cachedPremiumMu.Unlock()
+		return v.Uint64()
 	}
+	return cachedPremiumBps
 }
 
 func aavePremiumWei(amount *big.Int, bps uint64) *big.Int {
@@ -259,11 +271,7 @@ func flashSelfTest(ctx context.Context, ec *ethclient.Client) {
 	ctxT, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 
-	bps, errP := aaveFlashPremiumBps(ctxT, ec)
-	if errP != nil {
-		log.Printf("[FLASH SELF-TEST] FAIL: не удалось получить Aave premium: %v", errP)
-		return
-	}
+	bps := aaveFlashPremiumBpsCached(ctxT, ec)
 	log.Printf("[FLASH SELF-TEST] Aave premium = %d bps (%.2f%%)", bps, float64(bps)/100)
 
 	amount := big.NewInt(20_000_000_000_000_000) // 0.02 WETH (~$40)

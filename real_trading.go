@@ -457,12 +457,10 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 	ctxA, cancelA := context.WithTimeout(ctx, 25*time.Second)
 	defer cancelA()
 
-	bps, errPrem := aaveFlashPremiumBps(ctxA, ec)
-	if errPrem != nil {
-		bps = 5 // 0.05% по умолчанию (Aave V3 Base)
-	}
+	bps := aaveFlashPremiumBpsCached(ctxA, ec)
 	prem := aavePremiumWei(amount, bps)
 	repay := new(big.Int).Add(amount, prem)
+	needWeth := new(big.Int).Add(repay, flashMinProfitWei)
 
 	leg1Exp, err := routerGetAmountsOut(ctxA, ec, buyRouter, amount, []common.Address{addrWETH, quote})
 	if err != nil || leg1Exp == nil || leg1Exp.Sign() <= 0 {
@@ -470,18 +468,6 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 		return
 	}
 	minTok := minTokenAfterBuyLeg1(leg1Exp)
-
-	leg2Exp, err := routerGetAmountsOut(ctxA, ec, sellRouter, minTok, []common.Address{quote, addrWETH})
-	if err != nil || leg2Exp == nil || leg2Exp.Sign() <= 0 {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_ABORT leg2_quote | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
-		return
-	}
-	needWeth := new(big.Int).Add(repay, flashMinProfitWei)
-	if leg2Exp.Cmp(needWeth) < 0 {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP flash leg2Exp<repay | estProfit=$%.2f", time.Now().Format(time.RFC3339), pairLabel, estProfitUSD))
-		return
-	}
-	leg2Min := new(big.Int).Set(needWeth)
 
 	deadline := big.NewInt(time.Now().Add(60 * time.Second).Unix())
 	buyData, err := uniV2RouterABIv.Pack("swapExactTokensForTokens", amount, minTok, []common.Address{addrWETH, quote}, flashArbContract, deadline)
@@ -498,14 +484,14 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 		QuoteToken:       quote,
 		V3Sell:           false,
 		V3Fee:            0,
-		MinWethOut:       leg2Min,
+		MinWethOut:       needWeth,
 		MinTokenAfterBuy: minTok,
 		MinProfitWei:     new(big.Int).Set(flashMinProfitWei),
 		Deadline:         deadline,
 	}
 
 	if err := flashArbSimulate(ctxA, ec, trader, args); err != nil {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | err=%v | estProfit=$%.2f", time.Now().Format(time.RFC3339), pairLabel, err, estProfitUSD))
+		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | err=%v | estProfit=$%.2f | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, err, estProfitUSD, buyName, sellName))
 		return
 	}
 
@@ -589,10 +575,7 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 	ctxA, cancelA := context.WithTimeout(ctx, 30*time.Second)
 	defer cancelA()
 
-	bps, errPrem := aaveFlashPremiumBps(ctxA, ec)
-	if errPrem != nil {
-		bps = 5
-	}
+	bps := aaveFlashPremiumBpsCached(ctxA, ec)
 	prem := aavePremiumWei(amount, bps)
 	repay := new(big.Int).Add(amount, prem)
 	needWeth := new(big.Int).Add(repay, flashMinProfitWei)
@@ -625,30 +608,18 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 		return
 	}
 
-	var leg2OutExp *big.Int
 	var v3Sell bool
 	var sellRouter common.Address
 	var v3FeeU32 uint32
 	if v3First {
-		leg2OutExp, err = routerGetAmountsOut(ctxA, ec, v2Router, minTok, []common.Address{quote, addrWETH})
 		v3Sell = false
 		sellRouter = v2Router
 		v3FeeU32 = 0
 	} else {
-		leg2OutExp, err = quoteV3ExactInputSingle(ctxA, ec, quote, addrWETH, fee, minTok)
 		v3Sell = true
 		sellRouter = addrUniswapV3Router
 		v3FeeU32 = fee
 	}
-	if err != nil || leg2OutExp == nil || leg2OutExp.Sign() <= 0 {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_ABORT leg2_quote | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
-		return
-	}
-	if leg2OutExp.Cmp(needWeth) < 0 {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP flash leg2Exp<repay | estProfit=$%.2f | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, estProfitUSD, buyName, sellName))
-		return
-	}
-	leg2Min := new(big.Int).Set(needWeth)
 
 	args := flashArbArgs{
 		Asset:            addrWETH,
@@ -659,14 +630,14 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 		QuoteToken:       quote,
 		V3Sell:           v3Sell,
 		V3Fee:            v3FeeU32,
-		MinWethOut:       leg2Min,
+		MinWethOut:       needWeth,
 		MinTokenAfterBuy: minTok,
 		MinProfitWei:     new(big.Int).Set(flashMinProfitWei),
 		Deadline:         deadline,
 	}
 
 	if err := flashArbSimulate(ctxA, ec, trader, args); err != nil {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | err=%v | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, err, buyName, sellName))
+		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | err=%v | estProfit=$%.2f | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, err, estProfitUSD, buyName, sellName))
 		return
 	}
 

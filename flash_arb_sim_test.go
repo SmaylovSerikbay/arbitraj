@@ -54,10 +54,7 @@ func TestAaveFlashPremiumBps_BaseRPC(t *testing.T) {
 	defer ec.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	bps, err := aaveFlashPremiumBps(ctx, ec)
-	if err != nil {
-		t.Fatal(err)
-	}
+	bps := aaveFlashPremiumBpsCached(ctx, ec)
 	if bps == 0 || bps > 1000 {
 		t.Fatalf("unexpected FLASHLOAN_PREMIUM_TOTAL bps: %d", bps)
 	}
