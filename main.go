@@ -2377,27 +2377,41 @@ func main() {
 	}
 	appStats.started = time.Now()
 
+	httpPollMode := strings.TrimSpace(os.Getenv("BASE_FORCE_HTTP_POLL")) == "1"
 	wss, http, splitHTTP := loadRPCEndpoints()
-	if wss == "" {
-		log.Fatal("задайте BASE_WSS или ALCHEMY_WSS для событий; при RPC_URL_DRPC — WSS обязателен")
-	}
-	if strings.TrimSpace(os.Getenv("BASE_FORCE_HTTP_POLL")) != "1" {
+
+	if httpPollMode {
+		if http == "" {
+			drpc := strings.TrimSpace(os.Getenv("RPC_URL_DRPC"))
+			h := strings.TrimSpace(os.Getenv("BASE_HTTP"))
+			if drpc != "" {
+				http = drpc
+			} else if h != "" {
+				http = h
+			} else {
+				log.Fatal("BASE_FORCE_HTTP_POLL=1, но нет RPC_URL_DRPC или BASE_HTTP")
+			}
+		}
+		log.Printf("RPC: HTTP polling (dRPC/BASE_HTTP) — без WebSocket")
+	} else {
+		if wss == "" {
+			log.Fatal("задайте BASE_WSS или ALCHEMY_WSS для событий; или включите BASE_FORCE_HTTP_POLL=1")
+		}
 		wss = ensureWSSURL(wss)
-	}
-	switch {
-	case strings.TrimSpace(os.Getenv("RPC_URL_DRPC")) != "":
-		log.Printf("RPC: Alchemy/WebSocket (Sync, PairCreated, V3 Swap) + dRPC (eth_call, Quoter, газ)")
-	case splitHTTP:
-		log.Printf("RPC: WebSocket (события) + HTTP (вызовы)")
-	default:
-		log.Printf("RPC: один WebSocket — события и вызовы на одном соединении")
+		switch {
+		case strings.TrimSpace(os.Getenv("RPC_URL_DRPC")) != "":
+			log.Printf("RPC: WebSocket (Sync, PairCreated, V3 Swap) + dRPC (eth_call, Quoter, газ)")
+		case splitHTTP:
+			log.Printf("RPC: WebSocket (события) + HTTP (вызовы)")
+		default:
+			log.Printf("RPC: один WebSocket — события и вызовы на одном соединении")
+		}
 	}
 
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
 	delay := reconnectMinDelay
-	httpPollMode := strings.TrimSpace(os.Getenv("BASE_FORCE_HTTP_POLL")) == "1"
 	for {
 		if err := rootCtx.Err(); err != nil {
 			log.Printf("shutdown: %v", err)
