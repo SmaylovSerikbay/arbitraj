@@ -2448,6 +2448,7 @@ func main() {
 		} else {
 			log.Printf("dial WebSocket RPC…")
 		}
+		sessStart := time.Now()
 		sessCtx, cancelSess := context.WithCancel(rootCtx)
 		errDone := make(chan error, 1)
 		go func() { errDone <- runSession(sessCtx, wss, http, splitHTTP) }()
@@ -2463,6 +2464,9 @@ func main() {
 		case err := <-errDone:
 			cancelSess()
 			if err != nil && !errors.Is(err, context.Canceled) {
+				if time.Since(sessStart) > 30*time.Second {
+					delay = reconnectMinDelay
+				}
 				if isAlchemyThroughputNoise(err) {
 					log.Printf("session: лимит WSS-провайдера, переподключение через %v", delay)
 				} else {
