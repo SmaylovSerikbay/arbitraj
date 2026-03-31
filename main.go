@@ -2062,16 +2062,38 @@ func runSessionHTTPPoll(ctx context.Context, httpURL string) error {
 
 	flashSelfTest(ctx, ec)
 
-	log.Printf("BASE_FORCE_HTTP_POLL: HTTP опрос getReserves (аналитика, не для боя)")
+	log.Printf("BASE_FORCE_HTTP_POLL: HTTP опрос getReserves + V3 polling")
 	callOpts := &bind.CallOpts{Context: ctx}
 	tick := time.NewTicker(750 * time.Millisecond)
 	defer tick.Stop()
+	v3PollTick := time.NewTicker(3 * time.Second)
+	defer v3PollTick.Stop()
 	go heartbeatMinuteLoop(ctx, reg)
 	go statsSummaryLoop(ctx)
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
+		case <-v3PollTick.C:
+			reg.mu.RLock()
+			v3Quotes := make(map[common.Address]string, len(reg.v3Only))
+			for _, vq := range reg.v3Only {
+				if vq != nil {
+					v3Quotes[vq.quote] = vq.label
+				}
+			}
+			for _, tp := range reg.byKey {
+				q := tp.quoteToken()
+				if q != (common.Address{}) {
+					if _, ok := v3Quotes[q]; !ok {
+						v3Quotes[q] = tp.label
+					}
+				}
+			}
+			reg.mu.RUnlock()
+			for quote, label := range v3Quotes {
+				evaluateV3OnlyOpportunity(ctx, ec, quote, label)
+			}
 		case <-tick.C:
 			reg.mu.RLock()
 			pairs := make([]*trackedPair, 0, len(reg.byKey))
