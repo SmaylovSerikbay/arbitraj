@@ -297,16 +297,29 @@ func wethWeiToUSD(w *big.Int) float64 {
 	return f
 }
 
+var (
+	hardStopLastCheck time.Time
+	hardStopInterval  = 30 * time.Second
+)
+
 func hardStopIfLossExceeded(ctx context.Context, ec *ethclient.Client, trader common.Address) {
 	if !realTradingEnabled {
 		return
 	}
+	realMu.Lock()
+	if realStartBalanceSet && time.Since(hardStopLastCheck) < hardStopInterval {
+		realMu.Unlock()
+		return
+	}
+	realMu.Unlock()
+
 	bal, err := erc20Balance(ctx, ec, addrWETH, trader)
 	if err != nil || bal == nil {
 		return
 	}
 	curUSD := wethWeiToUSD(bal)
 	realMu.Lock()
+	hardStopLastCheck = time.Now()
 	if !realStartBalanceSet {
 		realStartBalanceUSD = curUSD
 		realStartBalanceSet = true
@@ -462,14 +475,8 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 	repay := new(big.Int).Add(amount, prem)
 	needWeth := new(big.Int).Add(repay, flashMinProfitWei)
 
-	leg1Exp, err := routerGetAmountsOut(ctxA, ec, buyRouter, amount, []common.Address{addrWETH, quote})
-	if err != nil || leg1Exp == nil || leg1Exp.Sign() <= 0 {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_ABORT leg1_quote | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
-		return
-	}
-	minTok := minTokenAfterBuyLeg1(leg1Exp)
-
 	deadline := big.NewInt(time.Now().Add(60 * time.Second).Unix())
+	minTok := big.NewInt(1)
 	buyData, err := uniV2RouterABIv.Pack("swapExactTokensForTokens", amount, minTok, []common.Address{addrWETH, quote}, flashArbContract, deadline)
 	if err != nil {
 		return
@@ -581,18 +588,7 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 	needWeth := new(big.Int).Add(repay, flashMinProfitWei)
 
 	deadline := big.NewInt(time.Now().Add(60 * time.Second).Unix())
-
-	var leg1OutExp *big.Int
-	if v3First {
-		leg1OutExp, err = quoteV3ExactInputSingle(ctxA, ec, addrWETH, quote, fee, amount)
-	} else {
-		leg1OutExp, err = routerGetAmountsOut(ctxA, ec, v2Router, amount, []common.Address{addrWETH, quote})
-	}
-	if err != nil || leg1OutExp == nil || leg1OutExp.Sign() <= 0 {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_ABORT leg1_quote | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
-		return
-	}
-	minTok := minTokenAfterBuyLeg1(leg1OutExp)
+	minTok := big.NewInt(1)
 
 	var buyRouter common.Address
 	var buyData []byte
