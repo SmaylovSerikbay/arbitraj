@@ -243,6 +243,89 @@ func flashArbSimulate(ctx context.Context, ec *ethclient.Client, from common.Add
 	return err
 }
 
+func flashSelfTest(ctx context.Context, ec *ethclient.Client) {
+	if flashArbContract == (common.Address{}) {
+		log.Printf("[FLASH SELF-TEST] пропуск: FLASH_ARB_CONTRACT не задан")
+		return
+	}
+	_, trader, err := parseTraderKey()
+	if err != nil {
+		log.Printf("[FLASH SELF-TEST] пропуск: TRADER_PRIVATE_KEY не задан: %v", err)
+		return
+	}
+
+	log.Printf("[FLASH SELF-TEST] проверка flash loan системы (WETH/USDC, eth_call)…")
+
+	ctxT, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+
+	bps, errP := aaveFlashPremiumBps(ctxT, ec)
+	if errP != nil {
+		log.Printf("[FLASH SELF-TEST] FAIL: не удалось получить Aave premium: %v", errP)
+		return
+	}
+	log.Printf("[FLASH SELF-TEST] Aave premium = %d bps (%.2f%%)", bps, float64(bps)/100)
+
+	amount := big.NewInt(20_000_000_000_000_000) // 0.02 WETH (~$40)
+	usdc := common.HexToAddress("0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913")
+
+	leg1Exp, errQ := routerGetAmountsOut(ctxT, ec, addrUniswapV2Router, amount, []common.Address{addrWETH, usdc})
+	if errQ != nil || leg1Exp == nil || leg1Exp.Sign() <= 0 {
+		log.Printf("[FLASH SELF-TEST] FAIL: leg1 quote (Uni V2 WETH→USDC): %v", errQ)
+		return
+	}
+	log.Printf("[FLASH SELF-TEST] leg1 (Uni V2 buy): 0.02 WETH → %s USDC (raw)", leg1Exp.String())
+
+	leg2Exp, errQ2 := routerGetAmountsOut(ctxT, ec, addrSushiV2Router, leg1Exp, []common.Address{usdc, addrWETH})
+	if errQ2 != nil || leg2Exp == nil || leg2Exp.Sign() <= 0 {
+		log.Printf("[FLASH SELF-TEST] FAIL: leg2 quote (Sushi V2 USDC→WETH): %v", errQ2)
+		return
+	}
+	log.Printf("[FLASH SELF-TEST] leg2 (Sushi V2 sell): %s USDC → %s WETH (raw)", leg1Exp.String(), leg2Exp.String())
+
+	deadline := big.NewInt(time.Now().Add(120 * time.Second).Unix())
+	minTok := big.NewInt(1)
+	buyData, errPack := uniV2RouterABIv.Pack("swapExactTokensForTokens", amount, minTok,
+		[]common.Address{addrWETH, usdc}, flashArbContract, deadline)
+	if errPack != nil {
+		log.Printf("[FLASH SELF-TEST] FAIL: pack buyData: %v", errPack)
+		return
+	}
+
+	args := flashArbArgs{
+		Asset:            addrWETH,
+		Amount:           amount,
+		BuyRouter:        addrUniswapV2Router,
+		BuyCalldata:      buyData,
+		SellRouter:       addrSushiV2Router,
+		QuoteToken:       usdc,
+		V3Sell:           false,
+		V3Fee:            0,
+		MinWethOut:       big.NewInt(1),
+		MinTokenAfterBuy: big.NewInt(1),
+		MinProfitWei:     big.NewInt(0),
+		Deadline:         deadline,
+	}
+
+	errSim := flashArbSimulate(ctxT, ec, trader, args)
+	if errSim != nil {
+		errStr := errSim.Error()
+		switch {
+		case strings.Contains(errStr, "ProfitTooLow"):
+			log.Printf("[FLASH SELF-TEST] OK (revert ProfitTooLow — контракт работает, просто нет профита на этой паре)")
+		case strings.Contains(errStr, "INSUFFICIENT_OUTPUT_AMOUNT"):
+			log.Printf("[FLASH SELF-TEST] OK (revert INSUFFICIENT_OUTPUT — контракт работает, ликвидность мала)")
+		case strings.Contains(errStr, "execution reverted"):
+			log.Printf("[FLASH SELF-TEST] WARN: revert: %s", errStr)
+			log.Printf("[FLASH SELF-TEST] (контракт откликнулся, но логика revert — проверь ликвидность/approve)")
+		default:
+			log.Printf("[FLASH SELF-TEST] FAIL: simulate error: %v", errSim)
+		}
+	} else {
+		log.Printf("[FLASH SELF-TEST] SUCCESS: eth_call simulate прошёл! Flash система полностью работает.")
+	}
+}
+
 func flashArbExecute(ctx context.Context, ec *ethclient.Client, pk *ecdsa.PrivateKey, from common.Address, a flashArbArgs) (*types.Transaction, error) {
 	if flashArbContract == (common.Address{}) {
 		return nil, errors.New("FLASH_ARB_CONTRACT not set")

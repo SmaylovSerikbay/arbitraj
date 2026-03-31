@@ -1986,6 +1986,8 @@ func runSessionWebSocket(ctx context.Context, wssURL, httpURL string, splitHTTP 
 		return err
 	}
 
+	flashSelfTest(ctx, ecCall)
+
 	innerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
@@ -2057,6 +2059,8 @@ func runSessionHTTPPoll(ctx context.Context, httpURL string) error {
 	go autoDiscoverBackground(ctx, ec, reg, nil)
 	go dexScreenerDiscoverLoop(ctx, ec, reg, nil)
 	go ethPriceRefreshLoop(ctx, ec)
+
+	flashSelfTest(ctx, ec)
 
 	log.Printf("BASE_FORCE_HTTP_POLL: HTTP опрос getReserves (аналитика, не для боя)")
 	callOpts := &bind.CallOpts{Context: ctx}
