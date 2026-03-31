@@ -2356,8 +2356,8 @@ func loadDotEnv() {
 		try = append(try, filepath.Join(filepath.Dir(exe), ".env"))
 	}
 	for _, p := range try {
-		if err := godotenv.Load(p); err == nil {
-			log.Printf("загружен .env: %s", p)
+		if err := godotenv.Overload(p); err == nil {
+			log.Printf("загружен .env: %s (overload)", p)
 			return
 		}
 	}
