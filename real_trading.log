@@ -1,0 +1,3 @@
+2026-03-31T04:02:26+05:00 | WETH/USDC | TX1_FAIL | hash=0x9dbf6fbba45a84992ee4ed1005a6ff692dbaf7d33a563ca55e71c8356af14773 | err=<nil>
+2026-03-31T06:33:51+05:00 | WETH/USDC | TX1_FAIL | hash=0xb5821dc1bce8053cc857cb8a98ed6938797420ade43fd4faf82e81c58ae92a41 | err=<nil>
+2026-03-31T06:33:51+05:00 | WETH/USDC | TX1_SUBMIT_FAIL UniV3 | err=500 Internal Server Error: {"id":470,"jsonrpc":"2.0","error":{"message":"Temporary internal error. Please retry, trace-id: 6985611289f1fdcf577f9ad0b20ac20d","code":19}}

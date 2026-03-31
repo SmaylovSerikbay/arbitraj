@@ -122,6 +122,7 @@ func loadRealTradingSettings() {
 	if realTradingEnabled {
 		log.Printf("REAL MODE: SIMULATION=0 | notional=$%.0f | slippage≤%.2f%% | hard-stop=$%.2f | log=%s",
 			notionalUSDForDisplay, realMaxSlippagePct, realLossLimitUSD, realTradeLogPath)
+		appendRealTradeLog(fmt.Sprintf("%s | SESSION_START | pid=%d", time.Now().Format(time.RFC3339), os.Getpid()))
 	} else {
 		log.Printf("SIMULATION=1 — без отправки транзакций (paper trading)")
 	}
