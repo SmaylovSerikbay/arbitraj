@@ -34,6 +34,7 @@ var (
 	realMaxSlippagePct       = 0.3   // %
 	realLossLimitUSD         = 10.0  // hard stop
 	realTradeLogPath         = "real_trading.log"
+	flashMinExecUSD          = 1.50  // don't send TX if estProfit < this (gas ~ $0.80 for flash)
 
 	realStartBalanceUSD float64
 	realStartBalanceSet bool
@@ -119,9 +120,14 @@ func loadRealTradingSettings() {
 	if v := strings.TrimSpace(os.Getenv("REAL_TRADE_LOG_FILE")); v != "" {
 		realTradeLogPath = v
 	}
+	if v := strings.TrimSpace(os.Getenv("FLASH_MIN_EXEC_USD")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			flashMinExecUSD = f
+		}
+	}
 	if realTradingEnabled {
-		log.Printf("REAL MODE: SIMULATION=0 | notional=$%.0f | slippage≤%.2f%% | hard-stop=$%.2f | log=%s",
-			notionalUSDForDisplay, realMaxSlippagePct, realLossLimitUSD, realTradeLogPath)
+		log.Printf("REAL MODE: SIMULATION=0 | notional=$%.0f | slippage≤%.2f%% | hard-stop=$%.2f | minExec=$%.2f | log=%s",
+			notionalUSDForDisplay, realMaxSlippagePct, realLossLimitUSD, flashMinExecUSD, realTradeLogPath)
 		appendRealTradeLog(fmt.Sprintf("%s | SESSION_START | pid=%d", time.Now().Format(time.RFC3339), os.Getpid()))
 	} else {
 		log.Printf("SIMULATION=1 — без отправки транзакций (paper trading)")
@@ -445,6 +451,10 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP FLASH_ARB_CONTRACT unset | estProfit=$%.2f", time.Now().Format(time.RFC3339), pairLabel, estProfitUSD))
 		return
 	}
+	if estProfitUSD < flashMinExecUSD {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP estProfit<minExec($%.2f<$%.2f) | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, estProfitUSD, flashMinExecUSD, buyName, sellName))
+		return
+	}
 	if isFlashBadToken(quote) {
 		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP flash bad-token cache | quote=%s", time.Now().Format(time.RFC3339), pairLabel, quote.Hex()))
 		return
@@ -548,6 +558,10 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 	}
 	if flashArbContract == (common.Address{}) {
 		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP FLASH_ARB_CONTRACT unset | estProfit=$%.2f", time.Now().Format(time.RFC3339), pairLabel, estProfitUSD))
+		return
+	}
+	if estProfitUSD < flashMinExecUSD {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | SKIP estProfit<minExec($%.2f<$%.2f) | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, estProfitUSD, flashMinExecUSD, buyName, sellName))
 		return
 	}
 	if isFlashBadToken(quote) {
