@@ -497,9 +497,12 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 		Deadline:         deadline,
 	}
 
-	if err := flashArbSimulate(ctxA, ec, trader, args); err != nil {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | err=%v | estProfit=$%.2f | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, err, estProfitUSD, buyName, sellName))
-		return
+	skipSim := flashSkipSimulate && estProfitUSD >= flashSkipSimMinUSD
+	if !skipSim {
+		if err := flashArbSimulate(ctxA, ec, trader, args); err != nil {
+			appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | err=%v | estProfit=$%.2f | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, err, estProfitUSD, buyName, sellName))
+			return
+		}
 	}
 
 	tx, err := flashArbExecute(ctxA, ec, pk, trader, args)
@@ -507,15 +510,21 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_TX_SUBMIT_FAIL | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
 		return
 	}
+	mode := "FLASH"
+	if skipSim {
+		mode = "FLASH_DIRECT"
+	}
 	rc, err := waitReceipt(ctxA, ec, tx.Hash(), 120*time.Second)
 	status := "SUCCESS"
 	if err != nil || rc == nil || rc.Status != 1 {
 		status = "FAILED"
-		markFlashBadToken(quote)
+		if !skipSim {
+			markFlashBadToken(quote)
+		}
 	}
 	hardStopIfLossExceeded(ctxA, ec, trader)
-	appendRealTradeLog(fmt.Sprintf("%s | %s | %s FLASH | estProfit=$%.2f | tx=%s",
-		time.Now().Format(time.RFC3339), pairLabel, status, estProfitUSD, tx.Hash().Hex()))
+	appendRealTradeLog(fmt.Sprintf("%s | %s | %s %s | estProfit=$%.2f | tx=%s",
+		time.Now().Format(time.RFC3339), pairLabel, status, mode, estProfitUSD, tx.Hash().Hex()))
 }
 
 // executeRealHybridV3V2RoundTrip — один tx: Aave flash loan + UniV3/V2 buy + V2/V3 sell через FlashArb.
@@ -632,9 +641,12 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 		Deadline:         deadline,
 	}
 
-	if err := flashArbSimulate(ctxA, ec, trader, args); err != nil {
-		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | err=%v | estProfit=$%.2f | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, err, estProfitUSD, buyName, sellName))
-		return
+	skipSim := flashSkipSimulate && estProfitUSD >= flashSkipSimMinUSD
+	if !skipSim {
+		if err := flashArbSimulate(ctxA, ec, trader, args); err != nil {
+			appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | err=%v | estProfit=$%.2f | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, err, estProfitUSD, buyName, sellName))
+			return
+		}
 	}
 
 	tx, err := flashArbExecute(ctxA, ec, pk, trader, args)
@@ -642,14 +654,20 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_TX_SUBMIT_FAIL | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
 		return
 	}
+	mode := "FLASH_HYBRID"
+	if skipSim {
+		mode = "FLASH_DIRECT_HYBRID"
+	}
 	rc, err := waitReceipt(ctxA, ec, tx.Hash(), 120*time.Second)
 	status := "SUCCESS"
 	if err != nil || rc == nil || rc.Status != 1 {
 		status = "FAILED"
-		markFlashBadToken(quote)
+		if !skipSim {
+			markFlashBadToken(quote)
+		}
 	}
 	hardStopIfLossExceeded(ctxA, ec, trader)
-	appendRealTradeLog(fmt.Sprintf("%s | %s | %s FLASH hybrid | route=%s→%s | estProfit=$%.2f | tx=%s",
-		time.Now().Format(time.RFC3339), pairLabel, status, buyName, sellName, estProfitUSD, tx.Hash().Hex()))
+	appendRealTradeLog(fmt.Sprintf("%s | %s | %s %s | route=%s→%s | estProfit=$%.2f | tx=%s",
+		time.Now().Format(time.RFC3339), pairLabel, status, mode, buyName, sellName, estProfitUSD, tx.Hash().Hex()))
 }
 

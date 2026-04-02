@@ -51,6 +51,8 @@ var (
 	flashLoanAmountWei   *big.Int // optional override; nil => use wethIn from signal
 	flashMinProfitWei    *big.Int
 	flashMaxTaxPct       float64 // 0 = only REAL_MAX_SLIPPAGE on leg1 min token
+	flashSkipSimulate    bool    // true = skip eth_call, send TX directly (cheap gas L2 strategy)
+	flashSkipSimMinUSD   float64 // min estimated profit to skip simulate (default $0.15)
 	flashBadTokenTTL     = 24 * time.Hour
 
 	flashBadMu    sync.RWMutex
@@ -104,9 +106,16 @@ func loadFlashArbSettings() {
 			flashBadTokenTTL = time.Duration(h * float64(time.Hour))
 		}
 	}
+	flashSkipSimulate = strings.TrimSpace(os.Getenv("FLASH_SKIP_SIMULATE")) == "1"
+	flashSkipSimMinUSD = 0.15
+	if v := strings.TrimSpace(os.Getenv("FLASH_SKIP_SIM_MIN_USD")); v != "" {
+		if f, err := parseFloatEnv(v); err == nil && f > 0 {
+			flashSkipSimMinUSD = f
+		}
+	}
 	if flashArbContract != (common.Address{}) {
-		log.Printf("FLASH ARB: contract=%s | minProfitWei=%s | maxTaxPct=%.2f | loanOverride=%v",
-			flashArbContract.Hex(), flashMinProfitWei.String(), flashMaxTaxPct, flashLoanAmountWei != nil)
+		log.Printf("FLASH ARB: contract=%s | minProfitWei=%s | maxTaxPct=%.2f | skipSim=%v (min$%.2f) | loanOverride=%v",
+			flashArbContract.Hex(), flashMinProfitWei.String(), flashMaxTaxPct, flashSkipSimulate, flashSkipSimMinUSD, flashLoanAmountWei != nil)
 	}
 }
 
