@@ -85,25 +85,67 @@ func main() {
 	}
 	defer wsc.Close()
 
-	ch := make(chan *types.Header, 8)
-	sub, err := wsc.SubscribeNewHead(context.Background(), ch)
+	// Убедиться, что по тому же WS работают обычные вызовы
+	wsBN, err := wsc.BlockNumber(ctx)
+	if err != nil {
+		log.Fatalf("WS eth_blockNumber: %v", err)
+	}
+	fmt.Printf("OK  по WebSocket eth_blockNumber = %d\n", wsBN)
+
+	bnHTTPStart, _ := hc.BlockNumber(ctx)
+
+	ch := make(chan *types.Header, 16)
+	subCtx := context.Background()
+	sub, err := wsc.SubscribeNewHead(subCtx, ch)
 	if err != nil {
 		log.Fatalf("eth_subscribe newHeads: %v", err)
 	}
 	defer sub.Unsubscribe()
 
-	select {
-	case err := <-sub.Err():
-		log.Fatalf("подписка WS: %v", err)
-	case h := <-ch:
-		if h == nil {
-			log.Fatal("получен пустой header")
+	wait := 90 * time.Second
+	fmt.Printf("ожидание newHead по eth_subscribe (до %s)…\n", wait)
+
+	var gotHead *types.Header
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+
+loop:
+	for {
+		select {
+		case err := <-sub.Err():
+			log.Fatalf("подписка WS: %v", err)
+		case h := <-ch:
+			if h != nil {
+				gotHead = h
+				break loop
+			}
+		case <-timer.C:
+			break loop
 		}
-		fmt.Printf("OK  newHead: block=%d hash=%s\n", h.Number.Uint64(), h.Hash().Hex())
-	case <-time.After(60 * time.Second):
-		log.Fatal("таймаут 60s: нет newHead по WebSocket — проверьте порт WS и что нода отдаёт eth_subscribe")
 	}
 
-	fmt.Println("\nВсе проверки пройдены: HTTP + WS указывают на рабочий Base RPC.")
-	fmt.Println("Убедитесь, что в .env те же BASE_HTTP / BASE_WSS, что и у ./arbitraj.")
+	bnHTTPEnd, _ := hc.BlockNumber(context.Background())
+
+	if gotHead != nil {
+		fmt.Printf("OK  newHead: block=%d hash=%s\n", gotHead.Number.Uint64(), gotHead.Hash().Hex())
+		fmt.Println("\nВсе проверки пройдены: HTTP + WS (включая eth_subscribe newHeads).")
+		fmt.Println("Убедитесь, что в .env те же BASE_HTTP / BASE_WSS, что и у ./arbitraj.")
+		return
+	}
+
+	fmt.Println("FAIL: за отведённое время не пришёл ни один newHead по WebSocket.")
+	fmt.Printf("     HTTP latest block: было %d, стало %d (за тот же интервал)\n", bnHTTPStart, bnHTTPEnd)
+	fmt.Println("     Примечание: бот использует eth_subscribe на логи (Sync / PairCreated / Swap), не newHeads.")
+	fmt.Println("     Если ./arbitraj печатает «Subscribed to Sync» и растёт счётчик событий — для арба WS достаточно.")
+	if bnHTTPEnd > bnHTTPStart {
+		fmt.Println()
+		fmt.Println("Цепь по HTTP движется, а newHead по WS нет — типичные причины:")
+		fmt.Println("  • В конфиге ноды для WS не включён API eth (например Reth: --http.ws, ws.api должен содержать eth).")
+		fmt.Println("  • Другой порт: попробуйте ws://127.0.0.1:8545, если WS на том же порту, что HTTP.")
+		fmt.Println("  • Баг/особенность клиента Base (op-reth/op-geth) для подписок — смотрите доки и флаги ws.")
+	} else {
+		fmt.Println()
+		fmt.Println("Номер блока по HTTP почти не менялся — нода может догонять голову или зависла; сначала дождитесь синхронизации.")
+	}
+	os.Exit(1)
 }
