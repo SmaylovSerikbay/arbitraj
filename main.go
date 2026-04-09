@@ -289,6 +289,9 @@ func printStatsSummaryBlock() {
 			formatWithCommas(wAero),
 		)
 	}
+	if totOpp == 0 && (h > 0 || m >= 15) {
+		fmt.Println("— При нулях: бот не «молчит» — см. Parsed events и quote/hybrid счётчики; нет маршрута где bestWei>wIn (до газа). На Base часы без окна — обычно, не баг RPC.")
+	}
 	fmt.Println("====================================================")
 }
 
