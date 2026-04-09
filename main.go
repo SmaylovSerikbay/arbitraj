@@ -1310,7 +1310,7 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 	// Сводка: только исполнимый по симуляции профит
 	if simPotNet.Sign() > 0 && simNetPct.Cmp(statsOpportunityThreshold) >= 0 {
 		tp.statMu.Lock()
-		allow := time.Since(tp.lastOppSampleAt) >= 1*time.Second
+		allow := time.Since(tp.lastOppSampleAt) >= 600*time.Millisecond
 		if allow {
 			tp.lastOppSampleAt = time.Now()
 		}
@@ -1468,7 +1468,7 @@ func evaluateV3OnlyOpportunity(parentCtx context.Context, ec *ethclient.Client, 
 func shouldPrint(netPct float64, buy, sell, pairLabel string, spam bool) bool {
 	key := fmt.Sprintf("%.4f|%s|%s|%s", netPct, buy, sell, pairLabel)
 	now := time.Now()
-	minGap := 400 * time.Millisecond
+	minGap := 280 * time.Millisecond
 	if spam {
 		minGap = 80 * time.Millisecond
 	}
