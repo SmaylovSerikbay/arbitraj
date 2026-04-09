@@ -53,7 +53,7 @@ var (
 	addrUSDbC = common.HexToAddress("0xd9aAEc86B65D86f6A7B5B1b0c42FFA531710b6CA")
 	addrDAI   = common.HexToAddress("0x50c5725949A6F0c72E6C4a641F24049A917DB0Cb")
 	// DEGEN: уточняйте на DexScreener (ниже — часто цитируемый контракт; замените при расхождении).
-	addrDEGEN = common.HexToAddress("0x4ed4E8615B61adEe945ee8F195E2B50c3Cf535d6")
+	addrDEGEN = common.HexToAddress("0x4ed4E862860beD51a9570e96d89aF5E1B0DfefED")
 	addrTOSHI = common.HexToAddress("0xAC1Bd2486aAf3B5C0fc3Fd868558b082a531B2B4")
 	addrBRETT = common.HexToAddress("0x532f27101965dd16442E59d40670FaF5eBB142E4")
 	addrAERO  = common.HexToAddress("0x940181a94A35A4569E4529A3CDfB74e38FD98631")
@@ -65,7 +65,7 @@ var (
 	addrBENJI  = common.HexToAddress("0xbc45647ea894030a4e9801ec03479739fa2485f0") // Basenji (мем)
 	// Приоритетные адреса из .env/плана (добавлены в стартовый список мониторинга).
 	addrDEGEN2  = common.HexToAddress("0x4edbc92d5a34f9510d5b44ab466502a8e07845a1")
-	addrVIRTUAL = common.HexToAddress("0x0b3e3284558222239713dA5A1df42502042C6758")
+	addrVIRTUAL = common.HexToAddress("0x0b3e328455c40589EEb4aB7B50f0D4a2DaE0CcE3")
 )
 
 const (
@@ -1985,7 +1985,10 @@ func statsSummaryLoop(ctx context.Context) {
 	}
 }
 
-func runSessionWebSocket(ctx context.Context, wssURL, httpURL string, splitHTTP bool) error {
+// runSessionWebSocket: события по WSS; eth_call/Quoter — по HTTP (split). Фоновый AUTO_DISCOVER и DexScreener
+// используют backgroundCtx (дочерний от rootCtx), чтобы длинные getLogs не обрывались при реконнекте WebSocket.
+// При splitHTTP и persistentHTTP — один долгоживущий ethclient на весь процесс (не Close при смене сессии).
+func runSessionWebSocket(ctx context.Context, rootCtx context.Context, wssURL, httpURL string, splitHTTP bool, persistentHTTP *ethclient.Client) error {
 	wsCli, err := ethclient.DialContext(ctx, wssURL)
 	if err != nil {
 		return err
@@ -1994,14 +1997,18 @@ func runSessionWebSocket(ctx context.Context, wssURL, httpURL string, splitHTTP 
 	defer wsCli.Close()
 
 	callCli := bind.ContractBackend(wsCli)
-	if splitHTTP && httpURL != "" {
+	closeDialHTTP := func() {}
+	if persistentHTTP != nil {
+		callCli = persistentHTTP
+	} else if splitHTTP && httpURL != "" {
 		hc, err := ethclient.DialContext(ctx, httpURL)
 		if err != nil {
 			return err
 		}
-		defer hc.Close()
+		closeDialHTTP = func() { hc.Close() }
 		callCli = hc
 	}
+	defer closeDialHTTP()
 	setStatsRPCOverview(describeStatsRPCOverview(wssURL, httpURL, splitHTTP))
 	ecCall, _ := callCli.(*ethclient.Client)
 	setGasOracleClient(ecCall)
@@ -2015,11 +2022,16 @@ func runSessionWebSocket(ctx context.Context, wssURL, httpURL string, splitHTTP 
 	flashSelfTest(ctx, ecCall)
 	runPipelineVerifyIfEnv(ctx, ecCall)
 
+	// Не привязываем тяжёлые HTTP-фоны к жизни WSS: при обрыве Sync/PairCreated discover не должен получать context canceled.
+	backgroundCtx, cancelBackground := context.WithCancel(rootCtx)
+	defer cancelBackground()
+
 	innerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	bump := make(chan struct{}, 1)
-	go autoDiscoverBackground(innerCtx, ecCall, reg, bump)
+	go autoDiscoverBackground(backgroundCtx, ecCall, reg, bump)
+	go dexScreenerDiscoverLoop(backgroundCtx, ecCall, reg, bump)
 
 	errPC := make(chan error, 1)
 	go func() { errPC <- listenPairCreated(innerCtx, wsCli, reg, bump) }()
@@ -2033,7 +2045,6 @@ func runSessionWebSocket(ctx context.Context, wssURL, httpURL string, splitHTTP 
 	}
 	go heartbeatMinuteLoop(innerCtx, reg)
 	go statsSummaryLoop(innerCtx)
-	go dexScreenerDiscoverLoop(innerCtx, ecCall, reg, bump)
 	go ethPriceRefreshLoop(innerCtx, ecCall)
 
 	select {
@@ -2159,12 +2170,12 @@ func runSessionHTTPPoll(ctx context.Context, httpURL string) error {
 	}
 }
 
-func runSession(ctx context.Context, wssURL, httpURL string, splitHTTP bool) error {
+func runSession(ctx context.Context, wssURL, httpURL string, splitHTTP bool, persistentHTTP *ethclient.Client, rootCtx context.Context) error {
 	if strings.TrimSpace(os.Getenv("BASE_FORCE_HTTP_POLL")) == "1" {
 		log.Printf("BASE_FORCE_HTTP_POLL=1: режим без WebSocket (только HTTP)")
 		return runSessionHTTPPoll(ctx, httpURL)
 	}
-	return runSessionWebSocket(ctx, wssURL, httpURL, splitHTTP)
+	return runSessionWebSocket(ctx, rootCtx, wssURL, httpURL, splitHTTP, persistentHTTP)
 }
 
 func schemeHTTPToWS(u string) string {
@@ -2543,6 +2554,19 @@ func main() {
 	rootCtx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
+	// Один HTTP-клиент на весь процесс при split (WSS + RPC_URL_DRPC/BASE_HTTP): eth_call не закрывается при реконнекте WS,
+	// фоновый AUTO_DISCOVER не ловит use-after-close на 127.0.0.1:8545.
+	var persistentHTTPRPC *ethclient.Client
+	if !httpPollMode && splitHTTP && strings.TrimSpace(http) != "" {
+		c, err := ethclient.DialContext(rootCtx, http)
+		if err != nil {
+			log.Fatalf("HTTP RPC для eth_call (%s): %v", http, err)
+		}
+		persistentHTTPRPC = c
+		defer func() { c.Close() }()
+		log.Printf("HTTP eth_call: постоянное соединение (не закрывается при реконнекте WebSocket)")
+	}
+
 	delay := reconnectMinDelay
 	for {
 		if err := rootCtx.Err(); err != nil {
@@ -2557,7 +2581,7 @@ func main() {
 		sessStart := time.Now()
 		sessCtx, cancelSess := context.WithCancel(rootCtx)
 		errDone := make(chan error, 1)
-		go func() { errDone <- runSession(sessCtx, wss, http, splitHTTP) }()
+		go func() { errDone <- runSession(sessCtx, wss, http, splitHTTP, persistentHTTPRPC, rootCtx) }()
 
 		select {
 		case <-rootCtx.Done():
