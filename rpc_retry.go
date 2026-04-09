@@ -3,7 +3,10 @@ package main
 import (
 	"context"
 	"errors"
+	"log"
 	"math/big"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -40,6 +43,26 @@ func bumpRPCQuoteHardFailures() {
 
 func RPCQuoteHardFailures() uint64 {
 	return atomic.LoadUint64(&rpcQuoteHardFailures)
+}
+
+// rpcCallRetryDelay — пауза между попытками при retryable RPC (дефолт 1s; на локальной ноде часто 50–100ms).
+var rpcCallRetryDelay = time.Second
+
+func loadRPCRetrySettings() {
+	s := strings.TrimSpace(os.Getenv("RPC_CALL_RETRY_MS"))
+	if s == "" {
+		rpcCallRetryDelay = time.Second
+		return
+	}
+	ms, err := strconv.Atoi(s)
+	if err != nil || ms < 0 {
+		rpcCallRetryDelay = time.Second
+		return
+	}
+	rpcCallRetryDelay = time.Duration(ms) * time.Millisecond
+	if rpcCallRetryDelay != time.Second {
+		log.Printf("RPC_CALL_RETRY_MS: пауза между ретраями eth_call/SuggestGasPrice = %v", rpcCallRetryDelay)
+	}
 }
 
 func isRetryableRPCErr(err error) bool {
@@ -87,7 +110,7 @@ func callContractRetry(ctx context.Context, ec *ethclient.Client, msg ethereum.C
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(time.Second):
+			case <-time.After(rpcCallRetryDelay):
 			}
 		}
 		out, err := ec.CallContract(ctx, msg, blockNumber)
@@ -114,7 +137,7 @@ func suggestGasPriceRetry(ctx context.Context, ec *ethclient.Client) (*big.Int, 
 			select {
 			case <-ctx.Done():
 				return nil, ctx.Err()
-			case <-time.After(time.Second):
+			case <-time.After(rpcCallRetryDelay):
 			}
 		}
 		gp, err := ec.SuggestGasPrice(ctx)

@@ -2415,6 +2415,7 @@ func loadDotEnv() {
 
 func main() {
 	loadDotEnv()
+	loadRPCRetrySettings()
 	loadNotionalAndEthHint()
 	loadAutoDiscoverSettings()
 	loadDexScreenerDiscoverSettings()

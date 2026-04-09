@@ -509,7 +509,7 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 
 	skipSim := flashSkipSimulate && estProfitUSD >= flashSkipSimMinUSD
 	if !skipSim {
-		if err := flashArbSimulate(ctxA, ec, trader, args); err != nil {
+		if err := flashArbSimulateDeadline(ctxA, ec, trader, args); err != nil {
 			appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | err=%v | estProfit=$%.2f | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, err, estProfitUSD, buyName, sellName))
 			return
 		}
@@ -657,7 +657,7 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 
 	skipSim := flashSkipSimulate && estProfitUSD >= flashSkipSimMinUSD
 	if !skipSim {
-		if err := flashArbSimulate(ctxA, ec, trader, args); err != nil {
+		if err := flashArbSimulateDeadline(ctxA, ec, trader, args); err != nil {
 			appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | err=%v | estProfit=$%.2f | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, err, estProfitUSD, buyName, sellName))
 			return
 		}

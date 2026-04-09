@@ -53,6 +53,7 @@ var (
 	flashMaxTaxPct       float64 // 0 = only REAL_MAX_SLIPPAGE on leg1 min token
 	flashSkipSimulate    bool    // true = skip eth_call, send TX directly (cheap gas L2 strategy)
 	flashSkipSimMinUSD   float64 // min estimated profit to skip simulate (default $0.15)
+	flashSimTimeout      = 8 * time.Second // eth_call executeArb: отдельный дедлайн (FLASH_SIM_TIMEOUT_SEC)
 	flashBadTokenTTL     = 24 * time.Hour
 
 	flashBadMu    sync.RWMutex
@@ -113,9 +114,15 @@ func loadFlashArbSettings() {
 			flashSkipSimMinUSD = f
 		}
 	}
+	flashSimTimeout = 8 * time.Second
+	if v := strings.TrimSpace(os.Getenv("FLASH_SIM_TIMEOUT_SEC")); v != "" {
+		if sec, err := parseFloatEnv(v); err == nil && sec > 0 {
+			flashSimTimeout = time.Duration(sec * float64(time.Second))
+		}
+	}
 	if flashArbContract != (common.Address{}) {
-		log.Printf("FLASH ARB: contract=%s | minProfitWei=%s | maxTaxPct=%.2f | skipSim=%v (min$%.2f) | loanOverride=%v",
-			flashArbContract.Hex(), flashMinProfitWei.String(), flashMaxTaxPct, flashSkipSimulate, flashSkipSimMinUSD, flashLoanAmountWei != nil)
+		log.Printf("FLASH ARB: contract=%s | minProfitWei=%s | maxTaxPct=%.2f | skipSim=%v (min$%.2f) | simTimeout=%v | loanOverride=%v",
+			flashArbContract.Hex(), flashMinProfitWei.String(), flashMaxTaxPct, flashSkipSimulate, flashSkipSimMinUSD, flashSimTimeout, flashLoanAmountWei != nil)
 	}
 }
 
@@ -262,6 +269,17 @@ func flashArbSimulate(ctx context.Context, ec *ethclient.Client, from common.Add
 	}
 	_, err = callContractRetry(ctx, ec, msg, nil)
 	return err
+}
+
+// flashArbSimulateDeadline — симуляция executeArb с дедлайном flashSimTimeout (не «висеть» на весь 25–30s ctx при сбое RPC).
+func flashArbSimulateDeadline(parent context.Context, ec *ethclient.Client, from common.Address, a flashArbArgs) error {
+	ctx := parent
+	var cancel context.CancelFunc
+	if flashSimTimeout > 0 {
+		ctx, cancel = context.WithTimeout(parent, flashSimTimeout)
+		defer cancel()
+	}
+	return flashArbSimulate(ctx, ec, from, a)
 }
 
 func flashSelfTest(ctx context.Context, ec *ethclient.Client) {
