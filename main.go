@@ -1270,7 +1270,7 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 	}
 	if enableV3Arb {
 		if ec := ethClientForV3(); ec != nil {
-			ctxH, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+			ctxH, cancel := context.WithTimeout(context.Background(), hybridQuoteTimeout)
 			hyPot, hyBuy, hySell, hyOk, hyWeiOut := hybridV3V2BestProfit(ctxH, ec, quoteTok, wethIn, wethIsT0, u0, u1, s0, s1, gasUSD)
 			cancel()
 			if hyOk && (simPotNet.Sign() <= 0 || hyPot.Cmp(&simPotNet) > 0) {
@@ -1347,7 +1347,7 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 		v3s := 0.0
 		if strings.Contains(buyName, "UniV3") || strings.Contains(sellName, "UniV3") {
 			if ec := ethClientForV3(); ec != nil {
-				ctxS, cancel := context.WithTimeout(context.Background(), 6*time.Second)
+				ctxS, cancel := context.WithTimeout(context.Background(), v3SlipEstimateTimeout)
 				v3s = estimateV3WETHInSlippagePct(ctxS, ec, quoteTok, wethIn)
 				cancel()
 			}
@@ -1373,7 +1373,7 @@ func (tp *trackedPair) evaluateAndMaybePrint() {
 	// Реальное исполнение (пока только V2↔V2 UniswapV2 <-> SushiSwap).
 	if realTradingEnabled {
 		if ec := ethClientForV3(); ec != nil { // это call-client (dRPC), выставлен через setGasOracleClient
-			ctxX, cancelX := context.WithTimeout(context.Background(), 25*time.Second)
+			ctxX, cancelX := context.WithTimeout(context.Background(), realExecuteTimeout)
 			if strings.Contains(buyName, "UniV3") || strings.Contains(sellName, "UniV3") {
 				executeRealHybridV3V2RoundTrip(ctxX, ec, tp.label, buyName, sellName, quoteTok, wethIn, simPotF)
 			} else {
@@ -1394,8 +1394,13 @@ var v3FeeTiers = []uint32{3000, 500, 10000, 100}
 var v3OnlyEvalThrottleMu sync.Mutex
 var v3OnlyLastEvalAt = make(map[string]time.Time)
 
-// Ограничение частоты bestV3OnlyProfit при потоке V3 Swap (иначе сотни eth_call/сек на USDC и т.п.).
-const v3OnlyEvalMinGap = 150 * time.Millisecond
+// Ограничение частоты bestV3OnlyProfit при потоке V3 Swap (V3_ONLY_EVAL_MIN_MS в .env).
+var v3OnlyEvalMinGap = 150 * time.Millisecond
+
+// Таймауты Quoter/гибрида и реального исполнения (секунды в .env).
+var hybridQuoteTimeout = 8 * time.Second
+var v3SlipEstimateTimeout = 6 * time.Second
+var realExecuteTimeout = 25 * time.Second
 
 func evaluateV3OnlyOpportunity(parentCtx context.Context, ec *ethclient.Client, quote common.Address, label string) {
 	if !enableV3Arb || ec == nil {
@@ -1415,7 +1420,7 @@ func evaluateV3OnlyOpportunity(parentCtx context.Context, ec *ethclient.Client, 
 		return
 	}
 	gasUSD := dynamicGasUSD()
-	ctxH, cancel := context.WithTimeout(parentCtx, 8*time.Second)
+	ctxH, cancel := context.WithTimeout(parentCtx, hybridQuoteTimeout)
 	pot, buy, sell, route, ok := bestV3OnlyProfit(ctxH, ec, quote, wethIn, gasUSD)
 	cancel()
 	if !ok || pot == nil || pot.Sign() <= 0 {
@@ -1445,7 +1450,7 @@ func evaluateV3OnlyOpportunity(parentCtx context.Context, ec *ethclient.Client, 
 	if !shouldPrint(netF, buy, sell, label, spamPrintMode) {
 		return
 	}
-	ctxS, cancelS := context.WithTimeout(parentCtx, 6*time.Second)
+	ctxS, cancelS := context.WithTimeout(parentCtx, v3SlipEstimateTimeout)
 	slipV3 := estimateV3WETHInSlippagePct(ctxS, ec, quote, wethIn)
 	cancelS()
 	if slipV3 > maxProfitSlippagePct {
@@ -2268,6 +2273,36 @@ func loadStatsOpportunityThreshold() {
 	log.Printf("STATS_OPPORTUNITY_THRESHOLD_PCT: не разобран %q, остаётся 0.5", s)
 }
 
+// loadHotPathSettings — задержки оценки V3/гибрида и таймаут исполнения flash (своя нода: можно снизить gap, укоротить таймауты).
+func loadHotPathSettings() {
+	v3OnlyEvalMinGap = 150 * time.Millisecond
+	hybridQuoteTimeout = 8 * time.Second
+	v3SlipEstimateTimeout = 6 * time.Second
+	realExecuteTimeout = 25 * time.Second
+	if v := strings.TrimSpace(os.Getenv("V3_ONLY_EVAL_MIN_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			v3OnlyEvalMinGap = time.Duration(n) * time.Millisecond
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("HYBRID_QUOTE_TIMEOUT_SEC")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			hybridQuoteTimeout = time.Duration(f * float64(time.Second))
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("V3_SLIP_ESTIMATE_TIMEOUT_SEC")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			v3SlipEstimateTimeout = time.Duration(f * float64(time.Second))
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("REAL_EXEC_TIMEOUT_SEC")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			realExecuteTimeout = time.Duration(f * float64(time.Second))
+		}
+	}
+	log.Printf("hot path: V3-only gap=%v | hybridQuoter=%v | v3Slip=%v | realExec=%v",
+		v3OnlyEvalMinGap, hybridQuoteTimeout, v3SlipEstimateTimeout, realExecuteTimeout)
+}
+
 func loadAutoDiscoverSettings() {
 	s := strings.TrimSpace(strings.ToLower(os.Getenv("AUTO_DISCOVER")))
 	if s == "0" || s == "false" || s == "off" {
@@ -2426,7 +2461,8 @@ func main() {
 	loadMinNetProfitPct()
 	loadGasAdaptiveMinNetProfit()
 	loadStatsOpportunityThreshold()
-	loadRealTradingSettings()
+	loadHotPathSettings()
+	loadRealTradingSettings() // внутри вызывает loadTxHotPathSettings
 	loadFlashArbSettings()
 	spamPrintMode = minNetProfitThreshold.Sign() <= 0
 	if spamPrintMode {

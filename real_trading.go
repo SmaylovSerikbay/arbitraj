@@ -36,6 +36,10 @@ var (
 	realTradeLogPath         = "real_trading.log"
 	flashMinExecUSD          = 1.50  // don't send TX if estProfit < this (gas ~ $0.80 for flash)
 
+	// TX_TIP_MULT / RECEIPT_POLL_MS — см. loadTxHotPathSettings (быстрее включение и опрос receipt на своей ноде).
+	txTipMult           = 1.0
+	receiptPollInterval = 1200 * time.Millisecond
+
 	realStartBalanceUSD float64
 	realStartBalanceSet bool
 
@@ -135,6 +139,41 @@ func loadRealTradingSettings() {
 	} else {
 		log.Printf("SIMULATION=1 — без отправки транзакций (paper trading)")
 	}
+	loadTxHotPathSettings()
+}
+
+func loadTxHotPathSettings() {
+	txTipMult = 1.0
+	receiptPollInterval = 1200 * time.Millisecond
+	if v := strings.TrimSpace(os.Getenv("TX_TIP_MULT")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			txTipMult = f
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("RECEIPT_POLL_MS")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 50 {
+			receiptPollInterval = time.Duration(n) * time.Millisecond
+		}
+	}
+	if txTipMult != 1.0 {
+		log.Printf("TX_TIP_MULT=%.3f — GasTipCap × множитель (конкуренция за блок)", txTipMult)
+	}
+	if receiptPollInterval != 1200*time.Millisecond {
+		log.Printf("RECEIPT_POLL_MS: опрос receipt каждые %v", receiptPollInterval)
+	}
+}
+
+func mulBigIntByFloat(x *big.Int, m float64) *big.Int {
+	if x == nil || m <= 1.0 {
+		return x
+	}
+	f := new(big.Float).SetInt(x)
+	f.Mul(f, big.NewFloat(m))
+	out, _ := f.Int(nil)
+	if out == nil || out.Sign() <= 0 {
+		return new(big.Int).Set(x)
+	}
+	return out
 }
 
 func appendRealTradeLog(line string) {
@@ -242,6 +281,9 @@ func sendDynamicTx(ctx context.Context, ec *ethclient.Client, pk *ecdsa.PrivateK
 	if err != nil || tip == nil || tip.Sign() <= 0 {
 		tip = big.NewInt(1_500_000) // ~0.0015 gwei
 	}
+	if txTipMult > 1.0 {
+		tip = mulBigIntByFloat(tip, txTipMult)
+	}
 	h, err := ec.HeaderByNumber(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -290,7 +332,7 @@ func waitReceipt(ctx context.Context, ec *ethclient.Client, h common.Hash, timeo
 		select {
 		case <-ctx.Done():
 			return nil, ctx.Err()
-		case <-time.After(1200 * time.Millisecond):
+		case <-time.After(receiptPollInterval):
 		}
 	}
 	return nil, errors.New("receipt timeout")
