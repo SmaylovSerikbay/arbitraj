@@ -1653,12 +1653,16 @@ func bootstrapRegistry(ctx context.Context, ec *ethclient.Client, reg *registry)
 		}
 		return errors.New("ни одна WETH-пара не найдена на обоих DEX (getPair пустой)")
 	}
+	ls := "0"
+	if logSkippedPairsEnabled() {
+		ls = "1"
+	}
 	if autoDiscoverEnabled {
-		log.Printf("bootstrap: вручную %d/%d пар | пулов Sync: %d | AUTO_DISCOVER в фоне (пропуски: нет Uni+Sushi V2 или WETH < AUTO_MIN_WETH_WEI; детали: LOG_SKIPPED_PAIRS=1)",
-			registered, len(list), reg.poolAddressCount())
+		log.Printf("bootstrap: вручную %d/%d пар | пулов Sync: %d | AUTO_DISCOVER в фоне (пропуски: нет Uni+Sushi V2 или WETH < AUTO_MIN_WETH_WEI; детали: LOG_SKIPPED_PAIRS=%s)",
+			registered, len(list), reg.poolAddressCount(), ls)
 	} else {
-		log.Printf("bootstrap: вручную %d/%d пар | пулов Sync: %d | AUTO_DISCOVER выключен (пропуски: нет Uni+Sushi V2 или WETH < AUTO_MIN_WETH_WEI; детали: LOG_SKIPPED_PAIRS=1)",
-			registered, len(list), reg.poolAddressCount())
+		log.Printf("bootstrap: вручную %d/%d пар | пулов Sync: %d | AUTO_DISCOVER выключен (пропуски: нет Uni+Sushi V2 или WETH < AUTO_MIN_WETH_WEI; детали: LOG_SKIPPED_PAIRS=%s)",
+			registered, len(list), reg.poolAddressCount(), ls)
 	}
 	return nil
 }
