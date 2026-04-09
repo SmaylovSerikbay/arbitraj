@@ -40,6 +40,11 @@ var (
 	txTipMult           = 1.0
 	receiptPollInterval = 1200 * time.Millisecond
 
+	// GAS_BID_* — при estProfit > порога часть профита уходит в priority fee (см. loadGasBidSettings).
+	gasBidProfitThresholdUSD = 2.0
+	gasBidProfitShare        = 0.40
+	gasBidMaxTipGwei         = 120.0
+
 	realStartBalanceUSD float64
 	realStartBalanceSet bool
 
@@ -140,6 +145,32 @@ func loadRealTradingSettings() {
 		log.Printf("SIMULATION=1 — без отправки транзакций (paper trading)")
 	}
 	loadTxHotPathSettings()
+	loadGasBidSettings()
+}
+
+func loadGasBidSettings() {
+	gasBidProfitThresholdUSD = 2.0
+	gasBidProfitShare = 0.40
+	gasBidMaxTipGwei = 120.0
+	if v := strings.TrimSpace(os.Getenv("GAS_BID_PROFIT_THRESHOLD_USD")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f >= 0 {
+			gasBidProfitThresholdUSD = f
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("GAS_BID_PROFIT_SHARE")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 && f <= 0.95 {
+			gasBidProfitShare = f
+		}
+	}
+	if v := strings.TrimSpace(os.Getenv("GAS_BID_MAX_TIP_GWEI")); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			gasBidMaxTipGwei = f
+		}
+	}
+	if gasBidProfitThresholdUSD >= 0 {
+		log.Printf("GAS_BID: если estProfit>$%.2f — до %.0f%% профита в priority fee (cap %.0f gwei/tip)",
+			gasBidProfitThresholdUSD, gasBidProfitShare*100, gasBidMaxTipGwei)
+	}
 }
 
 func loadTxHotPathSettings() {
@@ -174,6 +205,34 @@ func mulBigIntByFloat(x *big.Int, m float64) *big.Int {
 		return new(big.Int).Set(x)
 	}
 	return out
+}
+
+// priorityTipWeiFromProfit: при ожидаемом чистом профите > порога budget = estProfitUSD×share в $,
+// переводим в wei и делим на gas → tip/gas; не ниже SuggestGasTipCap×TX_TIP_MULT; верх — GAS_BID_MAX_TIP_GWEI.
+func priorityTipWeiFromProfit(suggestTip *big.Int, gas uint64, estProfitUSD float64) *big.Int {
+	if suggestTip == nil || suggestTip.Sign() <= 0 {
+		suggestTip = big.NewInt(1_500_000)
+	}
+	base := new(big.Int).Set(suggestTip)
+	if txTipMult > 1.0 {
+		base = mulBigIntByFloat(base, txTipMult)
+	}
+	if estProfitUSD < 0 || gas == 0 || estProfitUSD <= gasBidProfitThresholdUSD {
+		return base
+	}
+	budget := new(big.Rat).SetFloat64(estProfitUSD * gasBidProfitShare)
+	budget.Mul(budget, new(big.Rat).SetInt(tenPowU8(18)))
+	budget.Quo(budget, ethUsdHint)
+	perGas := new(big.Rat).Quo(budget, big.NewRat(int64(gas), 1))
+	tipWei := ratFloorInt(perGas)
+	if tipWei.Cmp(base) < 0 {
+		tipWei = new(big.Int).Set(base)
+	}
+	maxN := big.NewInt(int64(gasBidMaxTipGwei * 1e9))
+	if tipWei.Cmp(maxN) > 0 {
+		tipWei = maxN
+	}
+	return tipWei
 }
 
 func appendRealTradeLog(line string) {
@@ -260,7 +319,7 @@ func ensureApprove(ctx context.Context, ec *ethclient.Client, pk *ecdsa.PrivateK
 	if err != nil {
 		return nil, err
 	}
-	tx, err := sendDynamicTx(ctx, ec, pk, from, &token, data, big.NewInt(0))
+	tx, err := sendDynamicTx(ctx, ec, pk, from, &token, data, big.NewInt(0), -1)
 	if err != nil {
 		return nil, err
 	}
@@ -268,7 +327,7 @@ func ensureApprove(ctx context.Context, ec *ethclient.Client, pk *ecdsa.PrivateK
 	return rcpt, werr
 }
 
-func sendDynamicTx(ctx context.Context, ec *ethclient.Client, pk *ecdsa.PrivateKey, from common.Address, to *common.Address, data []byte, value *big.Int) (*types.Transaction, error) {
+func sendDynamicTx(ctx context.Context, ec *ethclient.Client, pk *ecdsa.PrivateKey, from common.Address, to *common.Address, data []byte, value *big.Int, estProfitUSD float64) (*types.Transaction, error) {
 	chainID, err := ec.ChainID(ctx)
 	if err != nil {
 		return nil, err
@@ -277,12 +336,9 @@ func sendDynamicTx(ctx context.Context, ec *ethclient.Client, pk *ecdsa.PrivateK
 	if err != nil {
 		return nil, err
 	}
-	tip, err := ec.SuggestGasTipCap(ctx)
-	if err != nil || tip == nil || tip.Sign() <= 0 {
-		tip = big.NewInt(1_500_000) // ~0.0015 gwei
-	}
-	if txTipMult > 1.0 {
-		tip = mulBigIntByFloat(tip, txTipMult)
+	suggestTip, err := ec.SuggestGasTipCap(ctx)
+	if err != nil || suggestTip == nil || suggestTip.Sign() <= 0 {
+		suggestTip = big.NewInt(1_500_000) // ~0.0015 gwei
 	}
 	h, err := ec.HeaderByNumber(ctx, nil)
 	if err != nil {
@@ -292,8 +348,6 @@ func sendDynamicTx(ctx context.Context, ec *ethclient.Client, pk *ecdsa.PrivateK
 	if baseFee == nil {
 		baseFee = big.NewInt(0)
 	}
-	feeCap := new(big.Int).Add(new(big.Int).Mul(baseFee, big.NewInt(2)), tip)
-
 	msg := ethereum.CallMsg{From: from, To: to, Value: value, Data: data}
 	gas, err := ec.EstimateGas(ctx, msg)
 	if err != nil || gas == 0 {
@@ -301,6 +355,8 @@ func sendDynamicTx(ctx context.Context, ec *ethclient.Client, pk *ecdsa.PrivateK
 	} else {
 		gas = uint64(math.Ceil(float64(gas) * 1.20))
 	}
+	tip := priorityTipWeiFromProfit(suggestTip, gas, estProfitUSD)
+	feeCap := new(big.Int).Add(new(big.Int).Mul(baseFee, big.NewInt(2)), tip)
 
 	tx := types.NewTx(&types.DynamicFeeTx{
 		ChainID:   chainID,
@@ -555,12 +611,13 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 	skipSim := flashSkipSimulate && estProfitUSD >= flashSkipSimMinUSD
 	if !skipSim {
 		if err := flashArbSimulateDeadline(ctxA, ec, trader, args); err != nil {
-			appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | err=%v | estProfit=$%.2f | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, err, estProfitUSD, buyName, sellName))
+			rev := revertReasonFromRPCErr(err)
+			appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | revert=%q | err=%v | estProfit=$%.2f | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, rev, err, estProfitUSD, buyName, sellName))
 			return
 		}
 	}
 
-	tx, err := flashArbExecute(ctxA, ec, pk, trader, args)
+	tx, err := flashArbExecute(ctxA, ec, pk, trader, args, estProfitUSD)
 	if err != nil {
 		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_TX_SUBMIT_FAIL | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
 		return
@@ -571,15 +628,26 @@ func executeRealV2V2RoundTrip(ctx context.Context, ec *ethclient.Client, pairLab
 	}
 	rc, err := waitReceipt(ctxA, ec, tx.Hash(), 120*time.Second)
 	status := "SUCCESS"
+	var onchainRev string
 	if err != nil || rc == nil || rc.Status != 1 {
 		status = "FAILED"
 		if !skipSim {
 			markFlashBadToken(quote)
 		}
+		ctxR, cancelR := context.WithTimeout(context.Background(), 12*time.Second)
+		if simErr := flashArbSimulate(ctxR, ec, trader, args); simErr != nil {
+			onchainRev = revertReasonFromRPCErr(simErr)
+		}
+		cancelR()
 	}
 	hardStopIfLossExceeded(ctxA, ec, trader)
-	appendRealTradeLog(fmt.Sprintf("%s | %s | %s %s | estProfit=$%.2f | tx=%s",
-		time.Now().Format(time.RFC3339), pairLabel, status, mode, estProfitUSD, tx.Hash().Hex()))
+	if onchainRev != "" {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | %s %s | estProfit=$%.2f | tx=%s | replay_revert=%q",
+			time.Now().Format(time.RFC3339), pairLabel, status, mode, estProfitUSD, tx.Hash().Hex(), onchainRev))
+	} else {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | %s %s | estProfit=$%.2f | tx=%s",
+			time.Now().Format(time.RFC3339), pairLabel, status, mode, estProfitUSD, tx.Hash().Hex()))
+	}
 }
 
 // executeRealHybridV3V2RoundTrip — один tx: Aave flash loan + UniV3/V2 buy + V2/V3 sell через FlashArb.
@@ -703,12 +771,13 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 	skipSim := flashSkipSimulate && estProfitUSD >= flashSkipSimMinUSD
 	if !skipSim {
 		if err := flashArbSimulateDeadline(ctxA, ec, trader, args); err != nil {
-			appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | err=%v | estProfit=$%.2f | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, err, estProfitUSD, buyName, sellName))
+			rev := revertReasonFromRPCErr(err)
+			appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_SIM_FAIL | revert=%q | err=%v | estProfit=$%.2f | route=%s→%s", time.Now().Format(time.RFC3339), pairLabel, rev, err, estProfitUSD, buyName, sellName))
 			return
 		}
 	}
 
-	tx, err := flashArbExecute(ctxA, ec, pk, trader, args)
+	tx, err := flashArbExecute(ctxA, ec, pk, trader, args, estProfitUSD)
 	if err != nil {
 		appendRealTradeLog(fmt.Sprintf("%s | %s | FLASH_TX_SUBMIT_FAIL | err=%v", time.Now().Format(time.RFC3339), pairLabel, err))
 		return
@@ -719,15 +788,26 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 	}
 	rc, err := waitReceipt(ctxA, ec, tx.Hash(), 120*time.Second)
 	status := "SUCCESS"
+	var onchainRev string
 	if err != nil || rc == nil || rc.Status != 1 {
 		status = "FAILED"
 		if !skipSim {
 			markFlashBadToken(quote)
 		}
+		ctxR, cancelR := context.WithTimeout(context.Background(), 12*time.Second)
+		if simErr := flashArbSimulate(ctxR, ec, trader, args); simErr != nil {
+			onchainRev = revertReasonFromRPCErr(simErr)
+		}
+		cancelR()
 	}
 	hardStopIfLossExceeded(ctxA, ec, trader)
-	appendRealTradeLog(fmt.Sprintf("%s | %s | %s %s | route=%s→%s | estProfit=$%.2f | tx=%s",
-		time.Now().Format(time.RFC3339), pairLabel, status, mode, buyName, sellName, estProfitUSD, tx.Hash().Hex()))
+	if onchainRev != "" {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | %s %s | route=%s→%s | estProfit=$%.2f | tx=%s | replay_revert=%q",
+			time.Now().Format(time.RFC3339), pairLabel, status, mode, buyName, sellName, estProfitUSD, tx.Hash().Hex(), onchainRev))
+	} else {
+		appendRealTradeLog(fmt.Sprintf("%s | %s | %s %s | route=%s→%s | estProfit=$%.2f | tx=%s",
+			time.Now().Format(time.RFC3339), pairLabel, status, mode, buyName, sellName, estProfitUSD, tx.Hash().Hex()))
+	}
 }
 
 // runPipelineVerifyIfEnv — при PIPELINE_VERIFY=1 и SIMULATION=0: реальный круг WETH→USDC→WETH через Uniswap V2 (проверка ключа, approve, swap, receipt).
@@ -792,7 +872,7 @@ func runPipelineVerifyIfEnv(ctx context.Context, ec *ethclient.Client) {
 		log.Printf("[PIPELINE_VERIFY] pack swap1: %v", err)
 		return
 	}
-	tx1, err := sendDynamicTx(ctxV, ec, pk, trader, &router, data1, big.NewInt(0))
+	tx1, err := sendDynamicTx(ctxV, ec, pk, trader, &router, data1, big.NewInt(0), -1)
 	if err != nil {
 		log.Printf("[PIPELINE_VERIFY] send swap1: %v", err)
 		return
@@ -827,7 +907,7 @@ func runPipelineVerifyIfEnv(ctx context.Context, ec *ethclient.Client) {
 		log.Printf("[PIPELINE_VERIFY] pack swap2: %v", err)
 		return
 	}
-	tx2, err := sendDynamicTx(ctxV, ec, pk, trader, &router, data2, big.NewInt(0))
+	tx2, err := sendDynamicTx(ctxV, ec, pk, trader, &router, data2, big.NewInt(0), -1)
 	if err != nil {
 		log.Printf("[PIPELINE_VERIFY] send swap2: %v", err)
 		return

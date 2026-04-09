@@ -177,43 +177,67 @@ func hybridV3V2BestProfit(
 		tokOut, err := quoteV3ExactInputSingle(ctx, ec, addrWETH, quote, fee, wethIn)
 		if err == nil && tokOut.Sign() > 0 {
 			var wback *big.Int
+			var sellRIn *big.Int
 			if wethIsT0 {
+				sellRIn = u1
 				wback = getAmountOut(tokOut, u1, u0)
 			} else {
+				sellRIn = u0
 				wback = getAmountOut(tokOut, u0, u1)
 			}
+			h := v2SimPessimismBps + v2HopImpactExtraBps(tokOut, sellRIn)
+			wback = applyBpsHaircut(wback, h)
 			try("UniV3("+feeTag(fee)+")", "UniswapV2", wback)
 			var wbackS *big.Int
+			var sellSRIn *big.Int
 			if wethIsT0 {
+				sellSRIn = s1
 				wbackS = getAmountOut(tokOut, s1, s0)
 			} else {
+				sellSRIn = s0
 				wbackS = getAmountOut(tokOut, s0, s1)
 			}
+			hS := v2SimPessimismBps + v2HopImpactExtraBps(tokOut, sellSRIn)
+			wbackS = applyBpsHaircut(wbackS, hS)
 			try("UniV3("+feeTag(fee)+")", "SushiSwapV2", wbackS)
 		}
 		// Купить на Uni V2, продать через V3
 		var xFromUni *big.Int
+		var buyUniRIn *big.Int
 		if wethIsT0 {
+			buyUniRIn = u0
 			xFromUni = getAmountOut(wethIn, u0, u1)
 		} else {
+			buyUniRIn = u1
 			xFromUni = getAmountOut(wethIn, u1, u0)
 		}
 		if xFromUni.Sign() > 0 {
-			wb, err3 := quoteV3ExactInputSingle(ctx, ec, quote, addrWETH, fee, xFromUni)
-			if err3 == nil && wb != nil && wb.Sign() > 0 {
-				try("UniswapV2", "UniV3("+feeTag(fee)+")", wb)
+			hU := v2SimPessimismBps + v2HopImpactExtraBps(wethIn, buyUniRIn)
+			xAdj := applyBpsHaircut(xFromUni, hU)
+			if xAdj.Sign() > 0 {
+				wb, err3 := quoteV3ExactInputSingle(ctx, ec, quote, addrWETH, fee, xAdj)
+				if err3 == nil && wb != nil && wb.Sign() > 0 {
+					try("UniswapV2", "UniV3("+feeTag(fee)+")", wb)
+				}
 			}
 		}
 		var xFromSu *big.Int
+		var buySuRIn *big.Int
 		if wethIsT0 {
+			buySuRIn = s0
 			xFromSu = getAmountOut(wethIn, s0, s1)
 		} else {
+			buySuRIn = s1
 			xFromSu = getAmountOut(wethIn, s1, s0)
 		}
 		if xFromSu.Sign() > 0 {
-			wb, err4 := quoteV3ExactInputSingle(ctx, ec, quote, addrWETH, fee, xFromSu)
-			if err4 == nil && wb != nil && wb.Sign() > 0 {
-				try("SushiSwapV2", "UniV3("+feeTag(fee)+")", wb)
+			hS := v2SimPessimismBps + v2HopImpactExtraBps(wethIn, buySuRIn)
+			xAdjS := applyBpsHaircut(xFromSu, hS)
+			if xAdjS.Sign() > 0 {
+				wb, err4 := quoteV3ExactInputSingle(ctx, ec, quote, addrWETH, fee, xAdjS)
+				if err4 == nil && wb != nil && wb.Sign() > 0 {
+					try("SushiSwapV2", "UniV3("+feeTag(fee)+")", wb)
+				}
 			}
 		}
 	}

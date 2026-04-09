@@ -368,7 +368,7 @@ func flashSelfTest(ctx context.Context, ec *ethclient.Client) {
 	}
 }
 
-func flashArbExecute(ctx context.Context, ec *ethclient.Client, pk *ecdsa.PrivateKey, from common.Address, a flashArbArgs) (*types.Transaction, error) {
+func flashArbExecute(ctx context.Context, ec *ethclient.Client, pk *ecdsa.PrivateKey, from common.Address, a flashArbArgs, estProfitUSD float64) (*types.Transaction, error) {
 	if flashArbContract == (common.Address{}) {
 		return nil, errors.New("FLASH_ARB_CONTRACT not set")
 	}
@@ -376,5 +376,5 @@ func flashArbExecute(ctx context.Context, ec *ethclient.Client, pk *ecdsa.Privat
 	if err != nil {
 		return nil, err
 	}
-	return sendDynamicTx(ctx, ec, pk, from, &flashArbContract, data, big.NewInt(0))
+	return sendDynamicTx(ctx, ec, pk, from, &flashArbContract, data, big.NewInt(0), estProfitUSD)
 }

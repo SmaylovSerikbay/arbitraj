@@ -159,6 +159,8 @@ func v3AeroHybridBestProfit(
 			if err != nil || wBack == nil || wBack.Sign() <= 0 {
 				continue
 			}
+			ha := v2SimPessimismBps + aeroSimExtraBps + v2HopImpactExtraBps(tokOut, tokOut)
+			wBack = applyBpsHaircut(wBack, ha)
 			try("UniV3("+feeTag(fee)+")", al, wBack)
 		}
 
@@ -167,11 +169,16 @@ func v3AeroHybridBestProfit(
 		if err != nil || tokFromAero == nil || tokFromAero.Sign() <= 0 {
 			continue
 		}
+		ta := v2SimPessimismBps + aeroSimExtraBps + v2HopImpactExtraBps(wethIn, wethIn)
+		tokAdj := applyBpsHaircut(tokFromAero, ta)
+		if tokAdj.Sign() <= 0 {
+			continue
+		}
 		for _, fee := range fees {
 			if p, err := getV3Pool(ctx, ec, addrWETH, quote, fee); err != nil || p == (common.Address{}) {
 				continue
 			}
-			wBack, err := quoteV3ExactInputSingle(ctx, ec, quote, addrWETH, fee, tokFromAero)
+			wBack, err := quoteV3ExactInputSingle(ctx, ec, quote, addrWETH, fee, tokAdj)
 			if err != nil || wBack == nil || wBack.Sign() <= 0 {
 				continue
 			}

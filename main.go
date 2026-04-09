@@ -1093,7 +1093,9 @@ func notionalUSDToWETHWei() *big.Int {
 	return ratFloorInt(num)
 }
 
-// Симуляция: WETH -> X на «buy» пуле, X -> WETH на «sell» пуле. buySushi=true — сначала Sushi.
+// Симуляция: WETH -> X на «buy» пуле, X -> WETH на «sell» пуле.
+// getAmountOut уже точный x*y=k + 997/1000 на ногу; дополнительно:
+// — после каждой ноги haircut bps (V2_SIM_PESSIMISM_BPS + штраф за долю сделки в резерве), чтобы оценка была пессимистичнее к фронт-рану и толстым сделкам в мем-пулах.
 func simulateWETHRoundTrip(
 	wethIsToken0 bool,
 	buyR0, buyR1, sellR0, sellR1 *big.Int,
@@ -1103,20 +1105,40 @@ func simulateWETHRoundTrip(
 		return nil, false
 	}
 	var xOut *big.Int
+	var buyRIn, sellRIn *big.Int
 	if wethIsToken0 {
+		buyRIn = buyR0
 		xOut = getAmountOut(wethIn, buyR0, buyR1)
 		if xOut.Sign() <= 0 {
 			return nil, false
 		}
+		h1 := v2SimPessimismBps + v2HopImpactExtraBps(wethIn, buyRIn)
+		xOut = applyBpsHaircut(xOut, h1)
+		if xOut.Sign() <= 0 {
+			return nil, false
+		}
+		sellRIn = sellR1
 		wethBack = getAmountOut(xOut, sellR1, sellR0)
 	} else {
+		buyRIn = buyR1
 		xOut = getAmountOut(wethIn, buyR1, buyR0)
 		if xOut.Sign() <= 0 {
 			return nil, false
 		}
+		h1 := v2SimPessimismBps + v2HopImpactExtraBps(wethIn, buyRIn)
+		xOut = applyBpsHaircut(xOut, h1)
+		if xOut.Sign() <= 0 {
+			return nil, false
+		}
+		sellRIn = sellR0
 		wethBack = getAmountOut(xOut, sellR0, sellR1)
 	}
 	if wethBack == nil || wethBack.Sign() <= 0 {
+		return nil, false
+	}
+	h2 := v2SimPessimismBps + v2HopImpactExtraBps(xOut, sellRIn)
+	wethBack = applyBpsHaircut(wethBack, h2)
+	if wethBack.Sign() <= 0 {
 		return nil, false
 	}
 	return wethBack, true
@@ -2465,6 +2487,7 @@ func main() {
 	loadDexScreenerDiscoverSettings()
 	loadV3ArbSettings()
 	loadAeroSettings()
+	loadV2PessimismSettings()
 	loadMinNetProfitPct()
 	loadGasAdaptiveMinNetProfit()
 	loadStatsOpportunityThreshold()
