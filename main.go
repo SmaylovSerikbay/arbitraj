@@ -1968,15 +1968,7 @@ func runSessionWebSocket(ctx context.Context, wssURL, httpURL string, splitHTTP 
 		defer hc.Close()
 		callCli = hc
 	}
-	if splitHTTP && httpURL != "" {
-		if strings.TrimSpace(os.Getenv("RPC_URL_DRPC")) != "" {
-			setStatsRPCOverview("Alchemy(WSS) + dRPC(HTTP)")
-		} else {
-			setStatsRPCOverview("WebSocket(WSS) + HTTP(calls)")
-		}
-	} else {
-		setStatsRPCOverview("WebSocket only")
-	}
+	setStatsRPCOverview(describeStatsRPCOverview(wssURL, httpURL, splitHTTP))
 	ecCall, _ := callCli.(*ethclient.Client)
 	setGasOracleClient(ecCall)
 	defer setGasOracleClient(nil)
@@ -2177,6 +2169,42 @@ func loadRPCEndpoints() (wss string, http string, splitHTTP bool) {
 	default:
 		return schemeHTTPToWS(h), h, useHTTPCalls
 	}
+}
+
+// rpcEndpointLooksLocal — localhost для корректной подписи в STATS/логе (не «Alchemy+dRPC» при своей ноде).
+func rpcEndpointLooksLocal(u string) bool {
+	u = strings.ToLower(strings.TrimSpace(u))
+	if u == "" {
+		return false
+	}
+	return strings.Contains(u, "127.0.0.1") ||
+		strings.Contains(u, "localhost") ||
+		strings.Contains(u, "[::1]") ||
+		strings.Contains(u, "0.0.0.0")
+}
+
+// describeStatsRPCOverview — человекочитаемый режим RPC для блока STATS (согласован с фактическими URL).
+func describeStatsRPCOverview(wssURL, httpURL string, splitHTTP bool) string {
+	if !splitHTTP || strings.TrimSpace(httpURL) == "" {
+		if rpcEndpointLooksLocal(wssURL) {
+			return "Local WebSocket (events+calls)"
+		}
+		return "WebSocket only"
+	}
+	lw, lh := rpcEndpointLooksLocal(wssURL), rpcEndpointLooksLocal(httpURL)
+	if lw && lh {
+		return "Local node (WSS + HTTP)"
+	}
+	if lw && !lh {
+		return "Mixed: local WSS + remote HTTP"
+	}
+	if !lw && lh {
+		return "Mixed: remote WSS + local HTTP"
+	}
+	if strings.TrimSpace(os.Getenv("RPC_URL_DRPC")) != "" {
+		return "WebSocket(WSS) + RPC_URL_DRPC(HTTP)"
+	}
+	return "WebSocket(WSS) + HTTP(calls)"
 }
 
 func ensureWSSURL(wss string) string {
@@ -2418,15 +2446,24 @@ func main() {
 				log.Fatal("BASE_FORCE_HTTP_POLL=1, но нет RPC_URL_DRPC или BASE_HTTP")
 			}
 		}
-		log.Printf("RPC: HTTP polling (dRPC/BASE_HTTP) — без WebSocket")
+		if rpcEndpointLooksLocal(http) {
+			log.Printf("RPC: HTTP polling (локальная нода) — без WebSocket")
+		} else {
+			log.Printf("RPC: HTTP polling — без WebSocket")
+		}
 	} else {
 		if wss == "" {
 			log.Fatal("задайте BASE_WSS или ALCHEMY_WSS для событий; или включите BASE_FORCE_HTTP_POLL=1")
 		}
 		wss = ensureWSSURL(wss)
+		drpc := strings.TrimSpace(os.Getenv("RPC_URL_DRPC"))
 		switch {
-		case strings.TrimSpace(os.Getenv("RPC_URL_DRPC")) != "":
-			log.Printf("RPC: WebSocket (Sync, PairCreated, V3 Swap) + dRPC (eth_call, Quoter, газ)")
+		case drpc != "":
+			if rpcEndpointLooksLocal(drpc) {
+				log.Printf("RPC: WebSocket (Sync, PairCreated, V3 Swap) + локальный HTTP (eth_call, Quoter, газ)")
+			} else {
+				log.Printf("RPC: WebSocket (Sync, PairCreated, V3 Swap) + отдельный HTTP (eth_call, Quoter, газ)")
+			}
 		case splitHTTP:
 			log.Printf("RPC: WebSocket (события) + HTTP (вызовы)")
 		default:
