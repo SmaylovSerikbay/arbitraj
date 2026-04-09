@@ -128,6 +128,9 @@ func loadRealTradingSettings() {
 	if realTradingEnabled {
 		log.Printf("REAL MODE: SIMULATION=0 | notional=$%.0f | slippage≤%.2f%% | hard-stop=$%.2f | minExec=$%.2f | log=%s",
 			notionalUSDForDisplay, realMaxSlippagePct, realLossLimitUSD, flashMinExecUSD, realTradeLogPath)
+		if strings.TrimSpace(os.Getenv("PIPELINE_VERIFY")) == "1" {
+			log.Printf("PIPELINE_VERIFY=1: при старте будет тестовый WETH↔USDC (Uni V2); после успеха поставьте 0 в .env")
+		}
 		appendRealTradeLog(fmt.Sprintf("%s | SESSION_START | pid=%d", time.Now().Format(time.RFC3339), os.Getpid()))
 	} else {
 		log.Printf("SIMULATION=1 — без отправки транзакций (paper trading)")
@@ -683,5 +686,118 @@ func executeRealHybridV3V2RoundTrip(ctx context.Context, ec *ethclient.Client, p
 	hardStopIfLossExceeded(ctxA, ec, trader)
 	appendRealTradeLog(fmt.Sprintf("%s | %s | %s %s | route=%s→%s | estProfit=$%.2f | tx=%s",
 		time.Now().Format(time.RFC3339), pairLabel, status, mode, buyName, sellName, estProfitUSD, tx.Hash().Hex()))
+}
+
+// runPipelineVerifyIfEnv — при PIPELINE_VERIFY=1 и SIMULATION=0: реальный круг WETH→USDC→WETH через Uniswap V2 (проверка ключа, approve, swap, receipt).
+// После успеха верните PIPELINE_VERIFY=0, иначе тест повторится при каждом рестарте.
+func runPipelineVerifyIfEnv(ctx context.Context, ec *ethclient.Client) {
+	if strings.TrimSpace(os.Getenv("PIPELINE_VERIFY")) != "1" {
+		return
+	}
+	if !realTradingEnabled {
+		log.Printf("[PIPELINE_VERIFY] пропуск: нужен SIMULATION=0")
+		return
+	}
+	pk, trader, err := parseTraderKey()
+	if err != nil {
+		log.Printf("[PIPELINE_VERIFY] ключ: %v", err)
+		return
+	}
+	ctxV, cancelV := context.WithTimeout(ctx, 4*time.Minute)
+	defer cancelV()
+
+	amount := new(big.Int).SetUint64(500_000_000_000_000) // 5e14 wei ≈ 0.0005 WETH
+	if s := strings.TrimSpace(os.Getenv("PIPELINE_VERIFY_WETH_WEI")); s != "" {
+		if bi, ok := new(big.Int).SetString(s, 10); ok && bi.Sign() > 0 {
+			amount = bi
+		}
+	}
+	maxAmt := new(big.Int).SetUint64(10_000_000_000_000_000) // 0.01 WETH
+	if amount.Cmp(maxAmt) > 0 {
+		log.Printf("[PIPELINE_VERIFY] отказ: сумма > 0.01 WETH (задайте меньше PIPELINE_VERIFY_WETH_WEI)")
+		return
+	}
+
+	bal, err := erc20Balance(ctxV, ec, addrWETH, trader)
+	if err != nil || bal == nil {
+		log.Printf("[PIPELINE_VERIFY] balance WETH: %v", err)
+		return
+	}
+	if bal.Cmp(amount) < 0 {
+		log.Printf("[PIPELINE_VERIFY] мало WETH на кошельке: have=%s wei, need=%s", bal.String(), amount.String())
+		return
+	}
+
+	router := addrUniswapV2Router
+	pathWS := []common.Address{addrWETH, addrUSDC}
+	pathSW := []common.Address{addrUSDC, addrWETH}
+	deadline := big.NewInt(time.Now().Add(15 * time.Minute).Unix())
+
+	log.Printf("[PIPELINE_VERIFY] старт: Uni V2 round-trip, amount=%s wei WETH, slippage≤%.2f%%", amount.String(), realMaxSlippagePct)
+
+	if _, err := ensureApprove(ctxV, ec, pk, trader, addrWETH, router, amount); err != nil {
+		log.Printf("[PIPELINE_VERIFY] approve WETH: %v", err)
+		return
+	}
+	expUSDC, err := routerGetAmountsOut(ctxV, ec, router, amount, pathWS)
+	if err != nil || expUSDC == nil || expUSDC.Sign() <= 0 {
+		log.Printf("[PIPELINE_VERIFY] getAmountsOut WETH→USDC: %v", err)
+		return
+	}
+	minUSDC := pctToMinOut(expUSDC, realMaxSlippagePct)
+	data1, err := uniV2RouterABIv.Pack("swapExactTokensForTokens", amount, minUSDC, pathWS, trader, deadline)
+	if err != nil {
+		log.Printf("[PIPELINE_VERIFY] pack swap1: %v", err)
+		return
+	}
+	tx1, err := sendDynamicTx(ctxV, ec, pk, trader, &router, data1, big.NewInt(0))
+	if err != nil {
+		log.Printf("[PIPELINE_VERIFY] send swap1: %v", err)
+		return
+	}
+	rc1, err := waitReceipt(ctxV, ec, tx1.Hash(), 120*time.Second)
+	if err != nil || rc1 == nil || rc1.Status != 1 {
+		log.Printf("[PIPELINE_VERIFY] swap WETH→USDC не прошёл: %v status=%v", err, rc1)
+		appendRealTradeLog(fmt.Sprintf("%s | PIPELINE_VERIFY | leg1 FAIL | tx=%s", time.Now().Format(time.RFC3339), tx1.Hash().Hex()))
+		return
+	}
+	log.Printf("[PIPELINE_VERIFY] leg1 OK WETH→USDC tx=%s", tx1.Hash().Hex())
+	appendRealTradeLog(fmt.Sprintf("%s | PIPELINE_VERIFY | leg1 OK | tx=%s", time.Now().Format(time.RFC3339), tx1.Hash().Hex()))
+
+	usdcBal, err := erc20Balance(ctxV, ec, addrUSDC, trader)
+	if err != nil || usdcBal == nil || usdcBal.Sign() <= 0 {
+		log.Printf("[PIPELINE_VERIFY] USDC balance после leg1: %v", err)
+		return
+	}
+	deadline = big.NewInt(time.Now().Add(15 * time.Minute).Unix())
+	if _, err := ensureApprove(ctxV, ec, pk, trader, addrUSDC, router, usdcBal); err != nil {
+		log.Printf("[PIPELINE_VERIFY] approve USDC: %v", err)
+		return
+	}
+	expWETH, err := routerGetAmountsOut(ctxV, ec, router, usdcBal, pathSW)
+	if err != nil || expWETH == nil || expWETH.Sign() <= 0 {
+		log.Printf("[PIPELINE_VERIFY] getAmountsOut USDC→WETH: %v", err)
+		return
+	}
+	minWETH := pctToMinOut(expWETH, realMaxSlippagePct)
+	data2, err := uniV2RouterABIv.Pack("swapExactTokensForTokens", usdcBal, minWETH, pathSW, trader, deadline)
+	if err != nil {
+		log.Printf("[PIPELINE_VERIFY] pack swap2: %v", err)
+		return
+	}
+	tx2, err := sendDynamicTx(ctxV, ec, pk, trader, &router, data2, big.NewInt(0))
+	if err != nil {
+		log.Printf("[PIPELINE_VERIFY] send swap2: %v", err)
+		return
+	}
+	rc2, err := waitReceipt(ctxV, ec, tx2.Hash(), 120*time.Second)
+	if err != nil || rc2 == nil || rc2.Status != 1 {
+		log.Printf("[PIPELINE_VERIFY] swap USDC→WETH не прошёл: %v status=%v (остались USDC на кошельке)", err, rc2)
+		appendRealTradeLog(fmt.Sprintf("%s | PIPELINE_VERIFY | leg2 FAIL | tx=%s", time.Now().Format(time.RFC3339), tx2.Hash().Hex()))
+		return
+	}
+	log.Printf("[PIPELINE_VERIFY] leg2 OK USDC→WETH tx=%s", tx2.Hash().Hex())
+	appendRealTradeLog(fmt.Sprintf("%s | PIPELINE_VERIFY | leg2 OK | tx=%s", time.Now().Format(time.RFC3339), tx2.Hash().Hex()))
+	log.Printf("[PIPELINE_VERIFY] успех: обе ноги прошли. Установите PIPELINE_VERIFY=0 в .env, перезапускайте бота без повторной проверки")
 }
 

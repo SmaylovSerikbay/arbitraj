@@ -1979,6 +1979,7 @@ func runSessionWebSocket(ctx context.Context, wssURL, httpURL string, splitHTTP 
 	}
 
 	flashSelfTest(ctx, ecCall)
+	runPipelineVerifyIfEnv(ctx, ecCall)
 
 	innerCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -2053,6 +2054,7 @@ func runSessionHTTPPoll(ctx context.Context, httpURL string) error {
 	go ethPriceRefreshLoop(ctx, ec)
 
 	flashSelfTest(ctx, ec)
+	runPipelineVerifyIfEnv(ctx, ec)
 
 	log.Printf("BASE_FORCE_HTTP_POLL: HTTP опрос getReserves + V3 polling")
 	callOpts := &bind.CallOpts{Context: ctx}
